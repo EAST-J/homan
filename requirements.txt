@@ -2,7 +2,7 @@ chumpy
 easydict
 ipdb
 matplotlib
-motpy
+motpy==0.0.9
 numpy
 opencv-python
 PyYAML==5.1
