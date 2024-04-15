@@ -47,7 +47,7 @@ conda activate phosa16
 
 ```
 mkdir -p external
-git clone --branch v0.2.1 https://github.com/facebookresearch/detectron2.git external/detectron2
+git clone --branch v0.4 https://github.com/facebookresearch/detectron2.git external/detectron2
 pip install external/detectron2
 ```
 
