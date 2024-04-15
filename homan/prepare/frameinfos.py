@@ -158,6 +158,7 @@ def get_frame_info(image,
             person_parameters[key] = torch.cat(
                 [param[key] for param in all_parameters])
     # Handling only 1 object
+    # obj_bboxes: 原图像size中的物体bounding_box start_point (obj_bboxes[0, 0], obj_bboxes[0, 1]) end_point (obj_bboxes[0, 2], obj_bboxes[0, 3])
     obj_mask_infos = mask_extractor.masks_from_bboxes(
         image,
         bbox_xy_to_wh(obj_bboxes),

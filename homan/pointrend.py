@@ -109,6 +109,7 @@ class MaskExtractor:
         except AttributeError:
             scores = masks.new_ones(masks.shape[0])
         pred_classes = instance.pred_classes
+        # masks为预测的结果, dtype: torch.bool
         bit_masks = BitMasks(masks.cpu())
         keep_annotations = []
         full_boxes = torch.tensor([[0, 0, image_size, image_size]] *
