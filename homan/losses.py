@@ -49,6 +49,76 @@ def project_bbox(vertices, renderer, bbox_expansion=0.0):
     return bboxes_xy
 
 
+class Losses_Obj():
+    def __init__(
+        self,
+        renderer,
+        ref_mask_object,
+        keep_mask_object,
+        camintr_rois_object,
+        camintr,
+        class_name,
+        inter_type="min",
+        hand_nb=1,
+    ):
+        """
+        Args:
+            inter_type (str): [centroid|min] centroid to penalize centroid distances
+                min to penalize minimum distance
+        """
+        self.renderer = nr.renderer.Renderer(image_size=REND_SIZE,
+                                             K=renderer.K,
+                                             R=renderer.R,
+                                             t=renderer.t,
+                                             orig_size=1)
+        self.inter_type = inter_type
+        self.ref_mask_object = ref_mask_object
+        self.keep_mask_object = keep_mask_object
+        self.camintr_rois_object = camintr_rois_object
+        # Necessary ! Otherwise camintr gets updated for some reason TODO check
+        self.camintr = camintr.clone()
+        self.thresh = 3  # z thresh for interaction loss
+        self.mse = torch.nn.MSELoss()
+        self.class_name = class_name
+
+        self.expansion = 0.2
+        self.interaction_map = INTERACTION_MAPPING[class_name]
+
+        self.interaction_pairs = None
+
+
+
+    def compute_sil_loss_object(self, verts, faces):
+        loss_sil = torch.Tensor([0.0]).float().cuda()
+        # Rendering happens in ROI
+        camintr = self.camintr_rois_object
+        rend = self.renderer(verts, faces, K=camintr, mode="silhouettes")
+        image = self.keep_mask_object * rend
+        l_m = torch.sum(
+            (image - self.ref_mask_object)**2) / self.keep_mask_object.sum()
+        loss_sil += l_m
+        ious = batch_mask_iou(image, self.ref_mask_object)
+        return {
+            "loss_sil_obj": loss_sil / len(verts)
+        }, {
+            'iou_object': ious.mean().item()
+        }
+
+
+    @staticmethod
+    def _compute_iou_1d(mask1, mask2):
+        """
+        mask1: (2).
+        mask2: (2).
+        """
+        o_l = torch.min(mask1[0], mask2[0])
+        o_r = torch.max(mask1[1], mask2[1])
+        i_l = torch.max(mask1[0], mask2[0])
+        i_r = torch.min(mask1[1], mask2[1])
+        inter = torch.clamp(i_r - i_l, min=0)
+        return inter / (o_r - o_l)
+
+
 class Losses():
     def __init__(
         self,

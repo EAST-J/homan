@@ -16,19 +16,22 @@ MANO_CLOSED_FACES = np.load("local_data/closed_fmano.npy")
 
 
 def compute_smooth_loss(
-    verts_hand,
     verts_obj,
+    verts_hand=None,
 ):
     # Assumes a single obj
-    hand_nb = verts_hand.shape[0] // verts_obj.shape[0]
-    time_hands = [verts_hand[hand_idx::hand_nb] for hand_idx in range(hand_nb)]
-    all_hand_verts = torch.cat(time_hands, 1)
-    # from libyana.visutils import imagify
-    # imagify.viz_pointsrow(all_hand_verts, "tmp.png")
-    # imagify.viz_pointsrow(all_hand_verts[:, :, 1:], "tmpz.png")
-    # import pudb
-    # pu.db
-    smooth_loss_hand = ((all_hand_verts[1:] - all_hand_verts[:-1])**2).mean()
+    if verts_hand is not None:
+        hand_nb = verts_hand.shape[0] // verts_obj.shape[0]
+        time_hands = [verts_hand[hand_idx::hand_nb] for hand_idx in range(hand_nb)]
+        all_hand_verts = torch.cat(time_hands, 1)
+        # from libyana.visutils import imagify
+        # imagify.viz_pointsrow(all_hand_verts, "tmp.png")
+        # imagify.viz_pointsrow(all_hand_verts[:, :, 1:], "tmpz.png")
+        # import pudb
+        # pu.db
+        smooth_loss_hand = ((all_hand_verts[1:] - all_hand_verts[:-1])**2).mean()
+    else:
+        smooth_loss_hand = torch.Tensor([0.0]).float().cuda()
     smooth_loss_obj = ((verts_obj[1:] - verts_obj[:-1])**2).mean()
     return {
         "loss_smooth_obj": smooth_loss_obj,

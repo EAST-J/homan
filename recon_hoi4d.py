@@ -21,6 +21,7 @@ from homan.utils.bbox import  make_bbox_square, bbox_xy_to_wh, bbox_wh_to_xy
 from homan.pose_optimization import find_optimal_poses
 from homan.lib2d import maskutils
 
+# TODO: 尝试修改Loss的权重或者其他？，感觉估计的效果一般
 
 def process_masks_to_infos(obj_masks, hand_masks):
     # 使用预先获得的mask，处理为detectron2的数据格式
@@ -31,9 +32,9 @@ def process_masks_to_infos(obj_masks, hand_masks):
         hand_occlusions = torch.from_numpy(hand_mask).unsqueeze(0)
         image_size = obj_mask.shape
         bit_masks = BitMasks(torch.from_numpy(obj_mask).unsqueeze(0))
-        full_boxes = torch.tensor([[0, 0, image_size[1], image_size[0]]] *
-                                  1).float()
-        full_sized_masks = bit_masks.crop_and_resize(full_boxes, image_size[0])
+        # full_boxes = torch.tensor([[0, 0, image_size[1], image_size[0]]] *
+        #                           1).float()
+        full_sized_masks = bit_masks.tensor
         obj_mask_info = {}
         non_zero_indices = np.nonzero(obj_mask)
         # 获取最小外接矩形的左上角和右下角坐标
@@ -73,21 +74,25 @@ def process_masks_to_infos(obj_masks, hand_masks):
 
 
 # Load images
-image_folder = "/remote-home/jiangshijian/data/HOI4D/Kettle_1/image"
+seq_name = "Kettle_1"
+image_folder = "/remote-home/jiangshijian/data/HOI4D/{}/image".format(seq_name)
 image_names = sorted(os.listdir(image_folder))
 
+exp_data_len = 40
 start_idx = 24
-if start_idx >= len(image_names) - 10:
-  start_idx = len(image_names) - 11
+if start_idx >= len(image_names) - exp_data_len:
+  start_idx = len(image_names) - exp_data_len - 1
 # 10 images for sample
-image_paths = [os.path.join(image_folder, image_name) for image_name in image_names[start_idx:start_idx + 10]]
+image_paths = [os.path.join(image_folder, image_name) for image_name in image_names[start_idx:start_idx + exp_data_len]]
 obj_masks_paths = [image_path.replace('image', 'obj_mask') for image_path in image_paths]
 hand_masks_paths = [image_path.replace('image', 'hand_mask') for image_path in image_paths]
 print(image_paths)
 print(obj_masks_paths)
 print(hand_masks_paths)
 
-obj_path = "/remote-home/jiangshijian/data/HOI4D/Kettle_1/oObj.obj" # gt_path:/remote-home/jiangshijian/data/HOI4D/Kettle_1/oObj.obj
+obj_path = "/remote-home/jiangshijian/data/HOI4D/{}/oObj_Simp.obj".format(seq_name) # gt_path:/remote-home/jiangshijian/data/HOI4D/Kettle_1/oObj.obj
+if not os.path.exists(obj_path):
+    obj_path = "/remote-home/jiangshijian/data/HOI4D/{}/oObj.obj".format(seq_name) 
 # Initialize object scale
 obj_scale = 0.08  # Obj dimension in meters (0.1 => 10cm, 0.01 => 1cm)
 obj_mesh = trimesh.load(obj_path, force="mesh")
@@ -97,9 +102,10 @@ obj_verts = np.array(obj_mesh.vertices).astype(np.float32)
 obj_verts = obj_verts - obj_verts.mean(0)
 obj_verts_can = obj_verts / np.linalg.norm(obj_verts, 2, 1).max() * obj_scale / 2
 obj_faces = np.array(obj_mesh.faces)
-# ! Decimating the mesh in case CUDA out of memory.
-obj_verts_can, obj_faces, _, _ = pcu.decimate_triangle_mesh(obj_verts_can, obj_faces, int(obj_faces.shape[0] / 10.))
-obj_verts_can = obj_verts_can.astype(np.float32)
+# ! Decimating the mesh in case CUDA out of memory
+if "Simp" not in obj_path:
+    obj_verts_can, obj_faces, _, _ = pcu.decimate_triangle_mesh(obj_verts_can, obj_faces, int(obj_faces.shape[0] / 10.))
+    obj_verts_can = obj_verts_can.astype(np.float32)
 # Convert images to numpy 
 images = [Image.open(image_path) for image_path in image_paths if (image_path.lower().endswith(".jpg") or image_path.lower().endswith(".png"))]
 obj_masks = [Image.open(mask_path) for mask_path in obj_masks_paths if (mask_path.lower().endswith(".jpg") or mask_path.lower().endswith(".png"))]
@@ -123,8 +129,8 @@ from handmocap.hand_mocap_api import HandMocap
 from homan.viz.vizframeinfo import viz_frame_info
 
 
-sample_folder = "tmp_hoi4d/"
-
+sample_folder = "tmp_hoi4d/{}".format(seq_name)
+os.makedirs(sample_folder, exist_ok=True)
 # Initialize segmentation and hand pose estimation models
 mask_extractor = MaskExtractor(pointrend_model_weights="/remote-home/jiangshijian/homan/external/model_final_edd263.pkl") # detectron2://PointRend/InstanceSegmentation/pointrend_rcnn_R_50_FPN_3x_coco/164955410/model_final_edd263.pkl
 frankmocap_hand_checkpoint = "/remote-home/jiangshijian/homan/external/frankmocap/extra_data/hand_module/pretrained_weights/pose_shape_best.pth"
@@ -140,7 +146,7 @@ camintrs = [camintr for _ in range(len(images_np))]
 # ! Step1: Initialize object motion, based on the object masks
 # obj_mask_infos type: List
 obj_mask_infos = process_masks_to_infos(obj_masks_np, hand_masks_np)
-person_parameters, _, super2d_imgs = get_frame_infos(images_np,
+person_parameters, _, _ = get_frame_infos(images_np,
                                                     mask_extractor=mask_extractor,
                                                     hand_predictor=hand_predictor,
                                                     hand_bboxes=hand_bboxes,
@@ -161,10 +167,7 @@ super2d_img = viz_frame_info(frame_info,
                                 save=False)
 
 tmp_ = Image.fromarray(super2d_img)
-tmp_.save('tmp_hoi4d/tmp_2d.png')
-# TODO: use the HOI4D provided mask to replace the predicted results
-
-
+tmp_.save(os.path.join(sample_folder, 'tmp_2d.png'))
 
 
 
@@ -286,6 +289,3 @@ model_fine, loss_evolution, imgs = optimize_hand_object(
 last_viz_idx = (finegrained_num_iterations // finegrained_viz_step) * finegrained_viz_step
 # video_step3 = display_video(os.path.join(step3_folder, "joint_optim.mp4"),
 #                             os.path.join(sample_folder, "jointoptim_step3.mp4"))
-
-
-# TODO: using the model_fine results to get the mesh.
