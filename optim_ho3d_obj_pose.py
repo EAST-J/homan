@@ -24,6 +24,9 @@ from handmocap.hand_mocap_api import HandMocap
 from homan.viz.vizframeinfo import viz_frame_info
 from homan.lib2d import maskutils
 import cv2
+from torchvision import transforms
+
+# TODO: 如何解决CUDA Memory的问题，考虑对于mask使用crop的mask进行优化？
 
 def process_masks_to_infos(obj_masks, hand_masks):
     # 使用预先获得的mask，处理为detectron2的数据格式
@@ -55,7 +58,7 @@ def process_masks_to_infos(obj_masks, hand_masks):
                                                    256).clone().detach()
         obj_mask_info.update({
                 "bbox":
-                bbox,
+                bbox, # bbox为原先图像空间中的包围框，格式为xywh
                 "class_id":
                 -1,
                 "full_mask":
@@ -63,10 +66,11 @@ def process_masks_to_infos(obj_masks, hand_masks):
                 "score":
                 None,
                 "square_bbox":
-                square_bbox,  # xy_wh
+                square_bbox,  # xy_wh 与bbox的中心相同，将包围框给放大
                 "crop_mask":
                 crop_masks[0].cpu().numpy(),
         })
+        # 1 for object part, 0 for background, -1 for hand part.
         target_masks = maskutils.add_occlusions([obj_mask_info["crop_mask"]],
                                             hand_occlusions,
                                             [obj_mask_info["square_bbox"]])[0]
@@ -76,11 +80,14 @@ def process_masks_to_infos(obj_masks, hand_masks):
     return obj_mask_infos
 
 # Load images
-seq_name = "ND2"
-exp_name ="pred"
+seq_name = "SB14"
+exp_name ="gt"
 data_root = "/remote-home/jiangshijian/data/HO3D_v3/train"
 optim_obj_scale = True
-image_paths = sorted(glob(os.path.join(data_root, seq_name, "rgb", "*.jpg")))[100:500]
+start_idx = 900
+end_idx = 1100
+image_paths = sorted(glob(os.path.join(data_root, seq_name, "rgb", "*.jpg")))[start_idx:end_idx]
+# pre_transform = transforms.Compose([])
 print(image_paths)
 print(len(image_paths))
 with open(os.path.join(data_root, seq_name, "meta", "0000.pkl"), "rb") as f:
@@ -90,8 +97,9 @@ if exp_name == 'gt':
     obj_path = os.path.join("local_data/datasets/ycbmodels/", objName, "textured_simple_2000.obj")
     obj_scale = 0.08  # Obj dimension in meters (0.1 => 10cm, 0.01 => 1cm)
 else:
-    obj_path = "/remote-home/jiangshijian/shap-e/drill.ply"
-    obj_scale = 0.5
+    # obj_path = "/remote-home/jiangshijian/shap-e/drill.ply"
+    obj_path = "/remote-home/jiangshijian/shap-e/cleaner.ply"
+    obj_scale = 0.1
 # Initialize object scale
 obj_mesh = trimesh.load(obj_path, force="mesh")
 obj_verts = np.array(obj_mesh.vertices).astype(np.float32)
@@ -100,15 +108,18 @@ obj_verts = np.array(obj_mesh.vertices).astype(np.float32)
 obj_verts = obj_verts - obj_verts.mean(0)
 obj_verts_can = obj_verts / np.linalg.norm(obj_verts, 2, 1).max() * obj_scale / 2
 obj_faces = np.array(obj_mesh.faces)
+
+# image_transform = transforms.Compose([transforms.Resize((240, 320))])
+# mask_transform = transforms.Compose([])
 # Convert images to numpy 
-images = [Image.open(image_path) for image_path in image_paths]
+images = [(Image.open(image_path)) for image_path in image_paths]
 images_np = [np.array(image) for image in images]
-masks = [Image.open(image_path.replace("rgb", "seg")[:-4] + ".png") for image_path in image_paths] # need to resize
+masks = [(Image.open(image_path.replace("rgb", "seg")[:-4] + ".png")) for image_path in image_paths] # need to resize
 masks_np = [np.array(mask) for mask in masks]
 hand_masks_np = []
 obj_masks_np = []
 for mask in masks_np:
-    mask = cv2.resize(mask, (mask.shape[1] * 2, mask.shape[0] * 2))
+    mask = cv2.resize(mask, (images_np[0].shape[1], images_np[0].shape[0]))
     hand_mask = np.zeros((mask.shape[0], mask.shape[1]))
     obj_mask = np.zeros((mask.shape[0], mask.shape[1]))
     hand_mask[mask[:, :, -1] == 255] = 255
@@ -173,11 +184,11 @@ object_parameters = find_optimal_poses(
     vertices=obj_verts_can,
     faces=obj_faces,
     annotations=obj_mask_infos,
-    num_initializations=200,
-    num_iterations=10, # Increase to get more accurate initializations
+    num_initializations=100,
+    num_iterations=20, # Increase to get more accurate initializations
     Ks=np.stack(camintrs),
     viz_path=os.path.join(sample_folder, "optimal_pose.png"),
-    debug=False,
+    debug=True,
 )
 '''
 object_parameters: List, len(images)
@@ -201,7 +212,7 @@ from homan.jointopt import optimize_hand_object, optimize_object
 
 coarse_num_iterations = 201 # Increase to give more steps to converge
 coarse_viz_step = 10 # Decrease to visualize more optimization steps
-# TODO: select different loss weight to focus on the object poses
+
 coarse_loss_weights = {
         "lw_inter": 0,
         "lw_depth": 0,
@@ -213,7 +224,7 @@ coarse_loss_weights = {
         "lw_scale_obj": 0.000,
         "lw_v2d_hand": 00,
         "lw_smooth_hand": 0000,
-        "lw_smooth_obj": 1000,
+        "lw_smooth_obj": 500,
         "lw_pca": 0.000,
     }
 
@@ -297,5 +308,5 @@ for i in tqdm(range(len(image_paths))):
         "K": K,
         "obj_scale": model.int_scales_object.item()
     }
-    path_id = image_paths[i][-7:-4]
+    path_id = image_paths[i].split("/")[-1][:-4]
     np.savez(os.path.join(sample_folder, "obj_infos/{}.npz".format(path_id)), **data)

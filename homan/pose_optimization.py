@@ -13,6 +13,7 @@ from scipy.ndimage.morphology import distance_transform_edt
 import torch
 import torch.nn as nn
 from tqdm.auto import tqdm
+import cv2
 
 from libyana.camutils import project
 from libyana.conversions import npt
@@ -65,8 +66,8 @@ class PoseOptimizer(nn.Module):
 
         # Load reference mask.
         # Convention for silhouette-aware loss: -1=occlusion, 0=bg, 1=fg.
-        image_ref = torch.from_numpy((ref_image > 0).astype(np.float32))
-        keep_mask = torch.from_numpy((ref_image >= 0).astype(np.float32))
+        image_ref = torch.from_numpy((ref_image > 0).astype(np.float32)) # 物体的分割部分
+        keep_mask = torch.from_numpy((ref_image >= 0).astype(np.float32)) # 除了被遮挡的部分，即用来计算loss的部分
         self.register_buffer("image_ref",
                              image_ref.repeat(num_initializations, 1, 1))
         self.register_buffer("keep_mask",
@@ -81,8 +82,8 @@ class PoseOptimizer(nn.Module):
                                                        1)
         self.translations = nn.Parameter(translation_init.clone().float(),
                                          requires_grad=True)
-        mask_edge = self.compute_edges(image_ref.unsqueeze(0)).cpu().numpy()
-        edt = distance_transform_edt(1 - (mask_edge > 0))**(power * 2)
+        mask_edge = self.compute_edges(image_ref.unsqueeze(0)).cpu().numpy() # 获取mask的边缘信息
+        edt = distance_transform_edt(1 - (mask_edge > 0))**(power * 2) # 获取所有像素点到边缘的距离
         self.register_buffer(
             "edt_ref_edge",
             torch.from_numpy(edt).repeat(num_initializations, 1, 1).float())
@@ -139,14 +140,14 @@ class PoseOptimizer(nn.Module):
     def forward(self):
         verts = self.apply_transformation()
         image = self.keep_mask * self.renderer(
-            verts, self.faces, mode="silhouettes")
+            verts, self.faces, mode="silhouettes") # 渲染物体3D Model所获得的mask(手部部分会被自动mask掉)
         loss_dict = {}
         loss_dict["mask"] = torch.sum((image - self.image_ref)**2, dim=(1, 2))
         with torch.no_grad():
             iou = ioumetrics.batch_mask_iou(image.detach(),
                                             self.image_ref.detach())
         loss_dict["chamfer"] = self.lw_chamfer * torch.sum(
-            self.compute_edges(image) * self.edt_ref_edge, dim=(1, 2))
+            self.compute_edges(image) * self.edt_ref_edge, dim=(1, 2)) # 渲染的边缘到真值边缘的距离和
         loss_dict["offscreen"] = 100000 * self.compute_offscreen_loss(verts)
         return loss_dict, iou, image
 
@@ -267,55 +268,56 @@ def find_optimal_pose(
 
     # Translation is retrieved by matching the tight bbox of projected
     # vertices with the bbox of the target mask
-    translations_init = compute_optimal_translation(
-        bbox_target=np.array(bbox) * REND_SIZE / L,
-        vertices=torch.matmul(vertices.unsqueeze(0), rotations_init),
-        f=K[0, 0, 0].item() / max(image_size))
+        
+    # translations_init = compute_optimal_translation(
+    #     bbox_target=np.array(bbox) * REND_SIZE / L,
+    #     vertices=torch.matmul(vertices.unsqueeze(0), rotations_init),
+    #     f=K[0, 0, 0].item() / max(image_size))
     translations_init = TCO_init_from_boxes_zup_autodepth(
         bbox, torch.matmul(vertices.unsqueeze(0), rotations_init),
         K).unsqueeze(1)
-    if debug:
-        trans_verts = translations_init + torch.matmul(vertices,
-                                                       rotations_init)
-        proj_verts = project.batch_proj2d(trans_verts,
-                                          K.repeat(trans_verts.shape[0], 1,
-                                                   1)).cpu()
-        verts3d = trans_verts.cpu()
-        flat_verts = proj_verts.contiguous().view(-1, 2)
-        if viz:
-            plt.clf()
-            fig, axes = plt.subplots(1, 3)
-            ax = axes[0]
-            ax.imshow(image)
-            ax.scatter(flat_verts[:, 0], flat_verts[:, 1], s=1, alpha=0.2)
-            ax = axes[1]
-            ax.imshow(image)
-            for vert in proj_verts:
-                ax.scatter(vert[:, 0], vert[:, 1], s=1, alpha=0.2)
-            ax = axes[2]
-            for vert in verts3d:
-                ax.scatter(vert[:, 0], vert[:, 2], s=1, alpha=0.2)
+    # if debug:
+    #     trans_verts = translations_init + torch.matmul(vertices,
+    #                                                    rotations_init)
+    #     proj_verts = project.batch_proj2d(trans_verts,
+    #                                       K.repeat(trans_verts.shape[0], 1,
+    #                                                1)).cpu()
+    #     verts3d = trans_verts.cpu()
+    #     flat_verts = proj_verts.contiguous().view(-1, 2)
+        # if viz:
+        #     plt.clf()
+        #     fig, axes = plt.subplots(1, 3)
+        #     ax = axes[0]
+        #     ax.imshow(image)
+        #     ax.scatter(flat_verts[:, 0], flat_verts[:, 1], s=1, alpha=0.2)
+        #     ax = axes[1]
+        #     ax.imshow(image)
+        #     for vert in proj_verts:
+        #         ax.scatter(vert[:, 0], vert[:, 1], s=1, alpha=0.2)
+        #     ax = axes[2]
+        #     for vert in verts3d:
+        #         ax.scatter(vert[:, 0], vert[:, 2], s=1, alpha=0.2)
 
-            fig.savefig(os.path.join(viz_folder, "autotrans.png"))
-            plt.close()
+        #     fig.savefig(os.path.join(viz_folder, "autotrans.png"))
+        #     plt.close()
 
-        proj_verts = project.batch_proj2d(
-            trans_verts, camintr_roi.repeat(trans_verts.shape[0], 1, 1)).cpu()
-        flat_verts = proj_verts.contiguous().view(-1, 2)
-        if viz:
-            fig, axes = plt.subplots(1, 3)
-            ax = axes[0]
-            ax.imshow(mask)
-            ax.scatter(flat_verts[:, 0], flat_verts[:, 1], s=1, alpha=0.2)
-            ax = axes[1]
-            ax.imshow(mask)
-            for vert in proj_verts:
-                ax.scatter(vert[:, 0], vert[:, 1], s=1, alpha=0.2)
-            ax = axes[2]
-            for vert in verts3d:
-                ax.scatter(vert[:, 0], vert[:, 2], s=1, alpha=0.2)
-            fig.savefig(os.path.join(viz_folder, "autotrans_roi.png"))
-            plt.close()
+        # proj_verts = project.batch_proj2d(
+        #     trans_verts, camintr_roi.repeat(trans_verts.shape[0], 1, 1)).cpu()
+        # flat_verts = proj_verts.contiguous().view(-1, 2)
+        # if viz:
+        #     fig, axes = plt.subplots(1, 3)
+        #     ax = axes[0]
+        #     ax.imshow(mask)
+        #     ax.scatter(flat_verts[:, 0], flat_verts[:, 1], s=1, alpha=0.2)
+        #     ax = axes[1]
+        #     ax.imshow(mask)
+        #     for vert in proj_verts:
+        #         ax.scatter(vert[:, 0], vert[:, 1], s=1, alpha=0.2)
+        #     ax = axes[2]
+        #     for vert in verts3d:
+        #         ax.scatter(vert[:, 0], vert[:, 2], s=1, alpha=0.2)
+        #     fig.savefig(os.path.join(viz_folder, "autotrans_roi.png"))
+        #     plt.close()
 
     # Bring crop K to NC rendering space
     camintr_roi[:, :2] = camintr_roi[:, :2] / REND_SIZE
@@ -329,32 +331,35 @@ def find_optimal_pose(
         translation_init=translations_init,
         num_initializations=num_initializations,
         K=camintr_roi,
+        lw_chamfer=0.5, # TODO: 考虑是否加入chamfer的损失项
     )
     model.cuda()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     for step in range(num_iterations):
         optimizer.zero_grad()
         loss_dict, iou, sil = model()
-        if debug and (step % viz_step == 0):
-            debug_viz_folder = os.path.join(viz_folder, "poseoptim")
-            os.makedirs(debug_viz_folder, exist_ok=True)
-            imagify.viz_imgrow(sil,
-                               overlays=[
-                                   mask,
-                               ] * len(sil),
-                               viz_nb=4,
-                               path=os.path.join(debug_viz_folder,
-                                                 f"{step:04d}.png"))
-
         losses = sum(loss_dict.values())
         loss = losses.sum()
         loss.backward()
         optimizer.step()
-        if losses.min() < best_loss_single:
-            ind = torch.argmin(losses)
-            best_loss_single = losses[ind]
-            best_rots_single = model.rotations[ind].detach().clone()
-            best_trans_single = model.translations[ind].detach().clone()
+        ind = torch.argmin(losses)
+        if debug and (step % viz_step == 0):
+            debug_viz_folder = os.path.join(viz_folder, "poseoptim")
+            os.makedirs(debug_viz_folder, exist_ok=True)
+            # imagify.viz_imgrow(sil,
+            #                    overlays=[
+            #                        mask,
+            #                    ] * len(sil),
+            #                    viz_nb=4,
+            #                    path=os.path.join(debug_viz_folder,
+            #                                      f"{step:04d}.png"))
+            if losses.min() < best_loss_single:
+                best_sil = sil[ind].clone().detach().cpu().numpy()
+                vis_mask = np.hstack([best_sil, mask])
+                cv2.imwrite(os.path.join(debug_viz_folder,f"{step:04d}.png"), vis_mask * 255)
+        best_loss_single = losses[ind]
+            # best_rots_single = model.rotations[ind].detach().clone()
+            # best_trans_single = model.translations[ind].detach().clone()
         loop.set_description(f"loss: {best_loss_single.item():.3g}")
         loop.update()
     if best_rots is None:
