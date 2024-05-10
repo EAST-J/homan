@@ -331,7 +331,7 @@ def find_optimal_pose(
         translation_init=translations_init,
         num_initializations=num_initializations,
         K=camintr_roi,
-        lw_chamfer=0.5, # TODO: 考虑是否加入chamfer的损失项
+        lw_chamfer=0.0, # TODO: 考虑是否加入chamfer的损失项
     )
     model.cuda()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -469,6 +469,8 @@ def find_optimal_poses(image_size,
             "verts": vertices.detach(),
             "verts_trans": verts_trans.detach(),
         }
+        if "flow" in annotation.keys(): # 最后一帧没有光流的监督
+            object_parameters.update({"flows": torch.from_numpy(annotation["flow"]).cuda()})
         all_object_parameters.append(object_parameters)
         previous_rotations = rot6d_to_matrix(model.rotations.detach(
         ))  # num_initializations, 3, 2 rot6d rotations
@@ -488,6 +490,8 @@ def find_optimal_poses(image_size,
         # Copy useful mask information
         for key in ["target_masks", "K_roi", "masks", "verts"]:
             final_params[key] = obj_params[key].unsqueeze(0).cuda()
+        if "flows" in obj_params.keys():
+            final_params["flows"] = obj_params["flows"].unsqueeze(0).cuda()
         final_params["full_mask"] = info["full_mask"].cuda()
         all_final_params.append(final_params)
     return all_final_params

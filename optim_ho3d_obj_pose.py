@@ -26,16 +26,16 @@ from homan.lib2d import maskutils
 import cv2
 from torchvision import transforms
 
-# TODO: 如何解决CUDA Memory的问题，考虑对于mask使用crop的mask进行优化？
+# TODO: 如何解决CUDA Memory的问题
+# TODO: 加入tensorboard可视化loss的变化
 
-def process_masks_to_infos(obj_masks, hand_masks):
+def process_masks_to_infos(obj_masks, hand_masks, obj_flows=None):
     # 使用预先获得的mask，处理为detectron2的数据格式
     obj_mask_infos = []
-    for obj_mask, hand_mask in zip(obj_masks, hand_masks):
+    for i, (obj_mask, hand_mask) in enumerate(zip(obj_masks, hand_masks)):
         obj_mask = (obj_mask == 255)
         hand_mask = (hand_mask == 255)
         hand_occlusions = torch.from_numpy(hand_mask).unsqueeze(0)
-        image_size = obj_mask.shape
         bit_masks = BitMasks(torch.from_numpy(obj_mask).unsqueeze(0))
         # full_boxes = torch.tensor([[0, 0, image_size[1], image_size[0]]] *
         #                           1).float()
@@ -75,17 +75,19 @@ def process_masks_to_infos(obj_masks, hand_masks):
                                             hand_occlusions,
                                             [obj_mask_info["square_bbox"]])[0]
         obj_mask_info.update({"target_crop_mask": target_masks})
+        if obj_flows is not None and i != len(obj_flows):
+            obj_mask_info.update({"flow": obj_flows[i]})
         obj_mask_infos.append(obj_mask_info)
-    
+
     return obj_mask_infos
 
 # Load images
-seq_name = "SB14"
-exp_name ="gt"
+seq_name = "MC6"
+exp_name ="pred"
 data_root = "/remote-home/jiangshijian/data/HO3D_v3/train"
 optim_obj_scale = True
-start_idx = 900
-end_idx = 1100
+start_idx = 0
+end_idx = 100
 image_paths = sorted(glob(os.path.join(data_root, seq_name, "rgb", "*.jpg")))[start_idx:end_idx]
 # pre_transform = transforms.Compose([])
 print(image_paths)
@@ -95,18 +97,19 @@ with open(os.path.join(data_root, seq_name, "meta", "0000.pkl"), "rb") as f:
 objName = data["objName"]
 if exp_name == 'gt':
     obj_path = os.path.join("local_data/datasets/ycbmodels/", objName, "textured_simple_2000.obj")
-    obj_scale = 0.08  # Obj dimension in meters (0.1 => 10cm, 0.01 => 1cm)
+    obj_init_scale = 0.08  # Obj dimension in meters (0.1 => 10cm, 0.01 => 1cm)
 else:
-    # obj_path = "/remote-home/jiangshijian/shap-e/drill.ply"
-    obj_path = "/remote-home/jiangshijian/shap-e/cleaner.ply"
-    obj_scale = 0.1
+    # obj_path = "/remote-home/jiangshijian/shap-e/drill.ply" # 0.5
+    # obj_path = "/remote-home/jiangshijian/shap-e/cleaner.ply" # 0.1
+    obj_path = "/remote-home/jiangshijian/shap-e/cracker_box.ply"
+    obj_init_scale = 0.5
 # Initialize object scale
 obj_mesh = trimesh.load(obj_path, force="mesh")
 obj_verts = np.array(obj_mesh.vertices).astype(np.float32)
 
 # Center and scale vertices
 obj_verts = obj_verts - obj_verts.mean(0)
-obj_verts_can = obj_verts / np.linalg.norm(obj_verts, 2, 1).max() * obj_scale / 2
+obj_verts_can = obj_verts / np.linalg.norm(obj_verts, 2, 1).max() * obj_init_scale / 2
 obj_faces = np.array(obj_mesh.faces)
 
 # image_transform = transforms.Compose([transforms.Resize((240, 320))])
@@ -116,6 +119,7 @@ images = [(Image.open(image_path)) for image_path in image_paths]
 images_np = [np.array(image) for image in images]
 masks = [(Image.open(image_path.replace("rgb", "seg")[:-4] + ".png")) for image_path in image_paths] # need to resize
 masks_np = [np.array(mask) for mask in masks]
+flows_np = [np.load(image_path.replace("rgb", "flow")[:-4] + ".npy") for image_path in image_paths[:-1]]
 hand_masks_np = []
 obj_masks_np = []
 for mask in masks_np:
@@ -151,7 +155,7 @@ camintrs = [camintr for _ in range(len(images_np))]
 obj_mask_infos: List
     full_mask: torch.bool H * W
 '''
-obj_mask_infos = process_masks_to_infos(obj_masks_np, hand_masks_np)
+obj_mask_infos = process_masks_to_infos(obj_masks_np, hand_masks_np, flows_np)
 # person_parameters, _, _ = get_frame_infos(images_np,
 #                                                     mask_extractor=mask_extractor,
 #                                                     hand_predictor=hand_predictor,
@@ -185,10 +189,10 @@ object_parameters = find_optimal_poses(
     faces=obj_faces,
     annotations=obj_mask_infos,
     num_initializations=100,
-    num_iterations=20, # Increase to get more accurate initializations
+    num_iterations=5, # Increase to get more accurate initializations
     Ks=np.stack(camintrs),
     viz_path=os.path.join(sample_folder, "optimal_pose.png"),
-    debug=True,
+    debug=False,
 )
 '''
 object_parameters: List, len(images)
@@ -224,8 +228,9 @@ coarse_loss_weights = {
         "lw_scale_obj": 0.000,
         "lw_v2d_hand": 00,
         "lw_smooth_hand": 0000,
-        "lw_smooth_obj": 500,
+        "lw_smooth_obj": 1.0,
         "lw_pca": 0.000,
+        "lw_flow_obj": 10.0
     }
 
 # Camera intrinsics in normalized coordinate
@@ -254,6 +259,7 @@ step2_viz_folder = os.path.join(step2_folder, "viz")
 #     viz_step=coarse_viz_step,
 #     viz_folder=step2_viz_folder,
 # )
+
 model, loss_evolution, imgs = optimize_object(
     object_parameters=object_parameters,
     objvertices=obj_verts_can,
@@ -306,7 +312,8 @@ for i in tqdm(range(len(image_paths))):
         "R": obj_rot_np[i],
         "T": obj_trans_np[i],
         "K": K,
-        "obj_scale": model.int_scales_object.item()
+        "obj_scale": model.int_scales_object.item(),
+        "obj_init_scale": obj_init_scale
     }
     path_id = image_paths[i].split("/")[-1][:-4]
     np.savez(os.path.join(sample_folder, "obj_infos/{}.npz".format(path_id)), **data)

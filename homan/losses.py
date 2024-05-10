@@ -4,6 +4,7 @@
 # pylint: disable=missing-function-docstring,missing-module-docstring,missing-class-docstring
 import neural_renderer as nr
 import torch
+import torch.nn.functional as F
 
 from homan.constants import INTERACTION_MAPPING, INTERACTION_THRESHOLD, REND_SIZE
 from homan.utils.bbox import check_overlap, compute_iou
@@ -55,6 +56,8 @@ class Losses_Obj():
         renderer,
         ref_mask_object,
         keep_mask_object,
+        full_mask_object,
+        flow_object,
         camintr_rois_object,
         camintr,
         class_name,
@@ -75,6 +78,8 @@ class Losses_Obj():
         self.ref_mask_object = ref_mask_object
         self.keep_mask_object = keep_mask_object
         self.camintr_rois_object = camintr_rois_object
+        self.full_mask_object = full_mask_object
+        self.flow_object = flow_object # (bs-1) *  H * W
         # Necessary ! Otherwise camintr gets updated for some reason TODO check
         self.camintr = camintr.clone()
         self.thresh = 3  # z thresh for interaction loss
@@ -102,6 +107,37 @@ class Losses_Obj():
             "loss_sil_obj": loss_sil / len(verts)
         }, {
             'iou_object': ious.mean().item()
+        }
+
+    def compute_flow_loss(self, verts, faces):
+        """
+        verts: B * V * 3
+        faces: B * F * 3
+        """
+        face_visibility = self.renderer(verts, faces, mode="visibility")[:, :faces.shape[1]].bool() # B * F
+        # 每一帧面片的是否可视
+        face_visibility = torch.logical_and(face_visibility[:-1], face_visibility[1:])
+        uv = project.batch_proj2d(verts, self.renderer.K)
+        # 此处的K由于是在NDC坐标系中，投影坐标范围为[0, 1]
+        pred_flow = uv[1:] - uv[:-1] # bs * N * 2
+        pred_flow[:, :, 1] *= self.flow_object.shape[1]
+        pred_flow[:, :, 0] *= self.flow_object.shape[2]
+        flow_mask = torch.zeros((verts.shape[0] - 1, verts.shape[1])).to(verts.device)
+        # TODO: 能否优化不使用for循环
+        for i in range(face_visibility.shape[0] - 1):
+            obj_vis_v_idx = faces[0, torch.logical_and(face_visibility[i], face_visibility[i+1])].reshape(-1)
+            flow_mask[i][torch.unique(obj_vis_v_idx)] = 1
+        mask_region = F.grid_sample(self.full_mask_object[:-1].unsqueeze(-1).float().permute(0, 3, 1, 2), (2 * uv[:-1] - 1.).unsqueeze(2), align_corners=False)
+        mask_region = mask_region[:, :, :, 0].transpose(1, 2).squeeze(-1)
+        flow_mask = torch.logical_and(mask_region>0.9, flow_mask)
+        # sample the gt flows
+        sampled_gt_flow = F.grid_sample(self.flow_object.permute(0, 3, 1, 2), (2 * uv[:-1] - 1.).unsqueeze(2), align_corners=False)
+        sampled_gt_flow = sampled_gt_flow[:, :, :, 0].transpose(1, 2) # bs * N * 2
+        # 只判断符号？还是直接利用值作监督？ TODO: 不计算被手部遮挡部分的loss
+        loss_flow = torch.sum((sampled_gt_flow - pred_flow)**2 * flow_mask.unsqueeze(-1)) / flow_mask.sum()
+        # loss_flow = torch.sum(torch.min(sampled_gt_flow * pred_flow, 0) * flow_mask.unsqueeze(-1)) / flow_mask.sum()
+        return {
+            "loss_flow_obj": loss_flow
         }
 
 

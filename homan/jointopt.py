@@ -240,6 +240,9 @@ def optimize_object(
         [obj["full_mask"].unsqueeze(0) for obj in object_parameters])
     obj_camintr_roi = torch.cat(
         [obj["K_roi"][:, 0] for obj in object_parameters])
+    obj_flows = torch.cat(
+        [obj["flows"] for obj in object_parameters[:-1]]
+    )
     model = HOMan_Obj(
         translations_object=obj_trans,  # [B, 1, 3]
         rotations_object=obj_rots,  # [B, 3, 3]
@@ -247,6 +250,7 @@ def optimize_object(
         faces_object=faces_object,  # [B, FN, 3]
         # Used for silhouette supervision
         target_masks_object=obj_tar_masks,  # [B, REND_SIZE, REND_SIZE]
+        flow_object=obj_flows, # [B-1, H, W, 2]
         # Used for ordinal depth loss
         masks_object=obj_full_masks,  # [B, IMAGE_SIZE, IMAGE_SIZE]
         camintr_rois_object=obj_camintr_roi,

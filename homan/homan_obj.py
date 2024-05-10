@@ -33,6 +33,7 @@ class HOMan_Obj(nn.Module):
         masks_object,
         camintr_rois_object,
         target_masks_object,
+        flow_object,
         class_name,
         int_scale_init=1.0,
         camintr=None,
@@ -71,6 +72,8 @@ class HOMan_Obj(nn.Module):
                              (target_masks_object > 0).float())
         self.register_buffer("keep_mask_object",
                              (target_masks_object >= 0).float())
+        self.register_buffer("flow_object",
+                             flow_object.float())
         self.register_buffer("camintr_rois_object", camintr_rois_object)
         self.register_buffer("faces_object", faces_object)
         self.register_buffer(
@@ -134,6 +137,8 @@ class HOMan_Obj(nn.Module):
             renderer=self.renderer,
             ref_mask_object=self.ref_mask_object,
             keep_mask_object=self.keep_mask_object,
+            full_mask_object=self.masks_object,
+            flow_object=self.flow_object,
             camintr_rois_object=self.camintr_rois_object,
             camintr=self.camintr,
             class_name=class_name,
@@ -153,7 +158,6 @@ class HOMan_Obj(nn.Module):
             intrinsic_scales=self.int_scales_object.abs(),
         )
         return obj_verts
-
 
 
     def forward(self, loss_weights=None):
@@ -192,6 +196,10 @@ class HOMan_Obj(nn.Module):
         #             min_hand_size=1000)
         #     loss_dict.update(loss_verts2d)
         #     metric_dict.update(metric_verts2d)
+        if loss_weights is None or loss_weights["lw_flow_obj"] > 0:
+            flow_loss_dict = self.losses.compute_flow_loss(
+                verts=verts_object, faces=self.faces_object)
+            loss_dict.update(flow_loss_dict)
         if loss_weights is None or loss_weights["lw_sil_obj"] > 0:
             sil_loss_dict, sil_metric_dict = self.losses.compute_sil_loss_object(
                 verts=verts_object, faces=self.faces_object)
