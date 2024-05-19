@@ -37,7 +37,9 @@ class HOMan_Obj(nn.Module):
         class_name,
         int_scale_init=1.0,
         camintr=None,
+        correspondence_info=None,
         optimize_object_scale=False,
+        optimize_object_texture=False,
         inter_type="centroid",
         image_size=640,
     ):
@@ -76,10 +78,15 @@ class HOMan_Obj(nn.Module):
                              flow_object.float())
         self.register_buffer("camintr_rois_object", camintr_rois_object)
         self.register_buffer("faces_object", faces_object)
-        self.register_buffer(
-            "textures_object",
-            torch.ones(faces_object.shape[0], faces_object.shape[1], 1, 1, 1,
-                       3))
+        if optimize_object_texture:
+            self.textures_object = nn.Parameter(
+                torch.ones(1, faces_object.shape[1], 1, 1, 1, 3),
+                requires_grad=True)
+        else:
+            self.register_buffer(
+                "textures_object",
+                torch.ones(faces_object.shape[0], faces_object.shape[1], 1, 1, 1,
+                        3))
         self.cuda()
 
         # Setup renderer
@@ -146,6 +153,10 @@ class HOMan_Obj(nn.Module):
         )
         verts_object_init, _ = self.get_verts_object()
         self.verts_object_init = verts_object_init.detach().clone()
+        self.correspondence_frame_idxs = correspondence_info["frame_infos"]
+        self.correspondence_frame_idxs = torch.tensor(self.correspondence_frame_idxs).to(self.translations_object.device) # N * 2
+        self.correspondence_uvs = correspondence_info["correspondence_points"]
+        self.correspondence_uvs = torch.tensor(self.correspondence_uvs).to(self.translations_object.device) # N * 2 * 5 * 2
 
 
     def get_verts_object(self):
@@ -168,72 +179,33 @@ class HOMan_Obj(nn.Module):
         loss_dict = {}
         metric_dict = {}
         verts_object, _ = self.get_verts_object()
-        if loss_weights is None or ((loss_weights["lw_smooth_hand"] > 0) or
-                                    (loss_weights["lw_smooth_obj"] > 0)):
+        if loss_weights is None or (loss_weights["lw_smooth_obj"] > 0):
             loss_smooth = lossutils.compute_smooth_loss(
                 verts_hand=None,
                 verts_obj=verts_object,
             )
             loss_dict.update(loss_smooth)
-        if loss_weights is None or loss_weights["lw_collision"] > 0:
-            # Pushes hand out of object, gradient not flowing through object !
-            loss_coll = 0
-            loss_dict.update(loss_coll)
-
-        if loss_weights is None or loss_weights["lw_contact"] > 0:
-            loss_contact, _ = 0
-            loss_dict.update(loss_contact)
-        # if loss_weights is None or loss_weights["lw_v2d_hand"] > 0:
-        #     if self.optimize_object_scale:
-        #         loss_verts2d, metric_verts2d = self.losses.compute_verts2d_loss_hand(
-        #             verts=verts_hand,
-        #             image_size=self.image_size,
-        #             min_hand_size=70)
-        #     else:
-        #         loss_verts2d, metric_verts2d = self.losses.compute_verts2d_loss_hand(
-        #             verts=verts_hand,
-        #             image_size=self.image_size,
-        #             min_hand_size=1000)
-        #     loss_dict.update(loss_verts2d)
-        #     metric_dict.update(metric_verts2d)
         if loss_weights is None or loss_weights["lw_flow_obj"] > 0:
             flow_loss_dict = self.losses.compute_flow_loss(
                 verts=verts_object, faces=self.faces_object)
             loss_dict.update(flow_loss_dict)
+        if loss_weights is None or loss_weights["lw_correspondence_obj"] > 0:
+            correspondence_loss_dict = self.losses.compute_correspondence_loss(
+                rotation_obj=rot6d_to_matrix(self.obj_rot_mult *self.rotations_object), 
+                translation_obj=self.translations_object,
+                correspondence_frame_idxs=self.correspondence_frame_idxs, correspondence_uvs=self.correspondence_uvs)
+            loss_dict.update(correspondence_loss_dict)
         if loss_weights is None or loss_weights["lw_sil_obj"] > 0:
             sil_loss_dict, sil_metric_dict = self.losses.compute_sil_loss_object(
                 verts=verts_object, faces=self.faces_object)
             loss_dict.update(sil_loss_dict)
             metric_dict.update(sil_metric_dict)
-
-            # loss_dict.update(
-            #     self.losses.compute_sil_loss_hand(verts=verts_hand,
-            #                                         faces=[self.faces_hand] *
-            #                                         len(verts_hand)))
-        # if loss_weights is None or loss_weights["lw_inter"] > 0:
-        #     # Interaction acts only on hand !
-        #     if not self.optimize_object_scale:
-        #         inter_verts_object = verts_object.unsqueeze(1).detach()
-        #     else:
-        #         inter_verts_object = verts_object.unsqueeze(1)
-        #     inter_loss_dict, inter_metric_dict = self.losses.compute_interaction_loss(
-        #         verts_hand_b=verts_hand_det.view(-1, self.hand_nb, 778, 3),
-        #         verts_object_b=inter_verts_object)
-        #     loss_dict.update(inter_loss_dict)
-        #     metric_dict.update(inter_metric_dict)
-
         if loss_weights is None or loss_weights["lw_scale_obj"] > 0:
             loss_dict[
                 "loss_scale_obj"] = lossutils.compute_intrinsic_scale_prior(
                     intrinsic_scales=self.int_scales_object,
                     intrinsic_mean=self.int_scale_object_mean,
                 )
-        # if loss_weights is None or loss_weights["lw_scale_hand"] > 0:
-        #     loss_dict[
-        #         "loss_scale_hand"] = lossutils.compute_intrinsic_scale_prior(
-        #             intrinsic_scales=self.int_scales_hand,
-        #             intrinsic_mean=self.int_scale_hand_mean,
-        #         )
         if loss_weights is None or loss_weights["lw_depth"] > 0:
             loss_dict.update(lossutils.compute_ordinal_depth_loss())
         return loss_dict, metric_dict

@@ -207,9 +207,11 @@ def optimize_object(
     class_name="default",
     objvertices=None,
     objfaces=None,
+    correspondence_info=None,
     loss_weights=None,
     num_iterations=400,
-    lr=1e-2,
+    lr=1e-4,
+    board=None,
     images=None,
     viz_step=10,
     viz_folder="tmp",
@@ -241,7 +243,7 @@ def optimize_object(
     obj_camintr_roi = torch.cat(
         [obj["K_roi"][:, 0] for obj in object_parameters])
     obj_flows = torch.cat(
-        [obj["flows"] for obj in object_parameters[:-1]]
+        [obj["flows"] if "flows" in obj.keys() else torch.zeros(1).to(obj_full_masks.device) for obj in object_parameters[:-1]]
     )
     model = HOMan_Obj(
         translations_object=obj_trans,  # [B, 1, 3]
@@ -255,6 +257,7 @@ def optimize_object(
         masks_object=obj_full_masks,  # [B, IMAGE_SIZE, IMAGE_SIZE]
         camintr_rois_object=obj_camintr_roi,
         camintr=camintr,
+        correspondence_info=correspondence_info,
         class_name=class_name,
         int_scale_init=1,
         optimize_object_scale=optimize_object_scale,
@@ -314,6 +317,7 @@ def optimize_object(
         }
         for k, val in loss_dict.items():
             loss_evolution[k].append(val.item())
+            board.add_scalar(k, val.item(), step)
         for k, val in metric_dict.items():
             loss_evolution[k].append(val)
         loss = sum(loss_dict_weighted.values())

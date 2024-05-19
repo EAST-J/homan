@@ -14,7 +14,7 @@ import itertools
 from libyana import distutils
 from libyana.camutils import project
 from libyana.metrics.iou import batch_mask_iou
-
+from scipy.ndimage.morphology import distance_transform_edt
 # from physim.datasets import collate
 
 
@@ -88,10 +88,40 @@ class Losses_Obj():
 
         self.expansion = 0.2
         self.interaction_map = INTERACTION_MAPPING[class_name]
-
+        self.pool = torch.nn.MaxPool2d(kernel_size=7,
+                                       stride=1,
+                                       padding=(7 // 2))
+        mask_edge = self.compute_edges(ref_mask_object).detach().cpu().numpy() # 获取mask的边缘信息
+        edt = distance_transform_edt(1 - (mask_edge > 0))**(0.5) # 获取所有像素点到边缘的距离
+        self.edt_ref_edge = torch.from_numpy(edt).float().to(self.ref_mask_object.device)
         self.interaction_pairs = None
 
+    def compute_edges(self, silhouette):
+        return self.pool(silhouette) - silhouette
 
+    def compute_offscreen_loss(self, verts):
+        """
+        Computes loss for offscreen penalty. This is used to prevent the degenerate
+        solution of moving the object offscreen to minimize the chamfer loss.
+        """
+        # On-screen means coord_xy between [-1, 1] and far > depth > 0
+        proj = nr.projection(
+            verts,
+            self.renderer.K,
+            self.renderer.R,
+            self.renderer.t,
+            self.renderer.dist_coeffs,
+            orig_size=1,
+        )
+        coord_xy, coord_z = proj[:, :, :2], proj[:, :, 2:]
+        zeros = torch.zeros_like(coord_z)
+        lower_right = torch.max(coord_xy - 1,
+                                zeros).sum()  # Amount greater than 1
+        upper_left = torch.max(-1 - coord_xy,
+                               zeros).sum()  # Amount less than -1
+        behind = torch.max(-coord_z, zeros).sum()
+        too_far = torch.max(coord_z - self.renderer.far, zeros).sum()
+        return lower_right + upper_left + behind + too_far
 
     def compute_sil_loss_object(self, verts, faces):
         loss_sil = torch.Tensor([0.0]).float().cuda()
@@ -103,11 +133,21 @@ class Losses_Obj():
             (image - self.ref_mask_object)**2) / self.keep_mask_object.sum()
         loss_sil += l_m
         ious = batch_mask_iou(image, self.ref_mask_object)
+        l_chamfer = torch.sum(self.compute_edges(image) * self.edt_ref_edge)
+        l_chamfer += 1000 * self.compute_offscreen_loss(verts)
         return {
-            "loss_sil_obj": loss_sil / len(verts)
+            "loss_sil_obj": loss_sil / len(verts), 
+            "loss_edge_obj": l_chamfer,
         }, {
             'iou_object': ious.mean().item()
         }
+
+    def compute_correspondence_loss(self, rotation_obj, translation_obj, correspondence_frame_idxs, correspondence_uvs):
+        rot1, rot2 = rotation_obj[correspondence_frame_idxs[:, 0]], rotation_obj[correspondence_frame_idxs[:, 1]]
+        trans1, trans2 = translation_obj[correspondence_frame_idxs[:, 0]], translation_obj[correspondence_frame_idxs[:, 1]]
+        # TODO：设计loss，如何利用correspondence信息
+
+        pass
 
     def compute_flow_loss(self, verts, faces):
         """
@@ -119,23 +159,28 @@ class Losses_Obj():
         face_visibility = torch.logical_and(face_visibility[:-1], face_visibility[1:])
         uv = project.batch_proj2d(verts, self.renderer.K)
         # 此处的K由于是在NDC坐标系中，投影坐标范围为[0, 1]
-        pred_flow = uv[1:] - uv[:-1] # bs * N * 2
-        pred_flow[:, :, 1] *= self.flow_object.shape[1]
-        pred_flow[:, :, 0] *= self.flow_object.shape[2]
+        former_uv = uv[:-1].detach()
+        pred_flow = uv[1:] - former_uv # bs * N * 2
         flow_mask = torch.zeros((verts.shape[0] - 1, verts.shape[1])).to(verts.device)
         # TODO: 能否优化不使用for循环
         for i in range(face_visibility.shape[0] - 1):
             obj_vis_v_idx = faces[0, torch.logical_and(face_visibility[i], face_visibility[i+1])].reshape(-1)
             flow_mask[i][torch.unique(obj_vis_v_idx)] = 1
-        mask_region = F.grid_sample(self.full_mask_object[:-1].unsqueeze(-1).float().permute(0, 3, 1, 2), (2 * uv[:-1] - 1.).unsqueeze(2), align_corners=False)
+        # 只计算投影在物体mask范围内
+        mask_region = F.grid_sample(self.full_mask_object[:-1].unsqueeze(-1).float().permute(0, 3, 1, 2), (2 * former_uv - 1.).clamp(-1, 1).unsqueeze(2), align_corners=False)
         mask_region = mask_region[:, :, :, 0].transpose(1, 2).squeeze(-1)
-        flow_mask = torch.logical_and(mask_region>0.9, flow_mask)
+        flow_mask = torch.logical_and(mask_region==1, flow_mask)
         # sample the gt flows
-        sampled_gt_flow = F.grid_sample(self.flow_object.permute(0, 3, 1, 2), (2 * uv[:-1] - 1.).unsqueeze(2), align_corners=False)
+        sampled_gt_flow = F.grid_sample(self.flow_object.permute(0, 3, 1, 2), (2 * former_uv - 1.).clamp(-1, 1).unsqueeze(2), align_corners=False) # 水平位移和垂直位移
         sampled_gt_flow = sampled_gt_flow[:, :, :, 0].transpose(1, 2) # bs * N * 2
-        # 只判断符号？还是直接利用值作监督？ TODO: 不计算被手部遮挡部分的loss
-        loss_flow = torch.sum((sampled_gt_flow - pred_flow)**2 * flow_mask.unsqueeze(-1)) / flow_mask.sum()
-        # loss_flow = torch.sum(torch.min(sampled_gt_flow * pred_flow, 0) * flow_mask.unsqueeze(-1)) / flow_mask.sum()
+        # 利用方向的cos夹角值来作监督（分别计算x方向和y方向的损失）
+        pred_flow_x, sampled_gt_flow_x = pred_flow[:, :, 0], sampled_gt_flow[:, :, 0]
+        pred_flow_y, sampled_gt_flow_y = pred_flow[:, :, 1], sampled_gt_flow[:, :, 1]
+        cos_x = pred_flow_x * sampled_gt_flow_x / (torch.abs(pred_flow_x) * torch.abs(sampled_gt_flow_x) + 1e-8)
+        cos_y = pred_flow_y * sampled_gt_flow_y / (torch.abs(pred_flow_y) * torch.abs(sampled_gt_flow_y) + 1e-8)
+        loss_flow_x = torch.sum((1 - cos_x) * flow_mask) / (flow_mask.sum() + 1e-8)
+        loss_flow_y = torch.sum((1 - cos_y) * flow_mask) / (flow_mask.sum() + 1e-8)
+        loss_flow = loss_flow_x + loss_flow_y
         return {
             "loss_flow_obj": loss_flow
         }

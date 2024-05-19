@@ -25,9 +25,11 @@ from homan.viz.vizframeinfo import viz_frame_info
 from homan.lib2d import maskutils
 import cv2
 from torchvision import transforms
+from tensorboardX import SummaryWriter
+import json
 
+# TODO: 考虑除了光流能否再加入其他的损失进行帮助(先用GT的2D correspondence实验下效果，同时可以考虑一些单目的cues？E.g. depth or normal)
 # TODO: 如何解决CUDA Memory的问题
-# TODO: 加入tensorboard可视化loss的变化
 
 def process_masks_to_infos(obj_masks, hand_masks, obj_flows=None):
     # 使用预先获得的mask，处理为detectron2的数据格式
@@ -37,9 +39,6 @@ def process_masks_to_infos(obj_masks, hand_masks, obj_flows=None):
         hand_mask = (hand_mask == 255)
         hand_occlusions = torch.from_numpy(hand_mask).unsqueeze(0)
         bit_masks = BitMasks(torch.from_numpy(obj_mask).unsqueeze(0))
-        # full_boxes = torch.tensor([[0, 0, image_size[1], image_size[0]]] *
-        #                           1).float()
-        # full_sized_masks = bit_masks.crop_and_resize(full_boxes, max(image_size[0], image_size[1]))
         full_sized_masks = bit_masks.tensor
         obj_mask_info = {}
         non_zero_indices = np.nonzero(obj_mask)
@@ -97,7 +96,7 @@ with open(os.path.join(data_root, seq_name, "meta", "0000.pkl"), "rb") as f:
 objName = data["objName"]
 if exp_name == 'gt':
     obj_path = os.path.join("local_data/datasets/ycbmodels/", objName, "textured_simple_2000.obj")
-    obj_init_scale = 0.08  # Obj dimension in meters (0.1 => 10cm, 0.01 => 1cm)
+    obj_init_scale = 0.5 # Obj dimension in meters (0.1 => 10cm, 0.01 => 1cm)
 else:
     # obj_path = "/remote-home/jiangshijian/shap-e/drill.ply" # 0.5
     # obj_path = "/remote-home/jiangshijian/shap-e/cleaner.ply" # 0.1
@@ -112,14 +111,12 @@ obj_verts = obj_verts - obj_verts.mean(0)
 obj_verts_can = obj_verts / np.linalg.norm(obj_verts, 2, 1).max() * obj_init_scale / 2
 obj_faces = np.array(obj_mesh.faces)
 
-# image_transform = transforms.Compose([transforms.Resize((240, 320))])
-# mask_transform = transforms.Compose([])
 # Convert images to numpy 
 images = [(Image.open(image_path)) for image_path in image_paths]
 images_np = [np.array(image) for image in images]
 masks = [(Image.open(image_path.replace("rgb", "seg")[:-4] + ".png")) for image_path in image_paths] # need to resize
 masks_np = [np.array(mask) for mask in masks]
-flows_np = [np.load(image_path.replace("rgb", "flow")[:-4] + ".npy") for image_path in image_paths[:-1]]
+flows_np = [np.load(image_path.replace("rgb", "flow")[:-4] + ".npy") if os.path.exists(image_path.replace("rgb", "flow")[:-4] + ".npy") else None for image_path in image_paths[:-1]]
 hand_masks_np = []
 obj_masks_np = []
 for mask in masks_np:
@@ -133,17 +130,11 @@ for mask in masks_np:
 
 sample_folder = os.path.join("tmp_ho3d/", seq_name, exp_name)
 os.makedirs(sample_folder, exist_ok=True)
+board = SummaryWriter(os.path.join(sample_folder, "board"))
 
-
-# hand_detector = get_hand_bbox_detector()
-# seq_boxes = trackseq.track_sequence(images, 256, hand_detector=hand_detector, setup={"right_hand": 1, "objects": 1})
-# hand_bboxes = {key: make_bbox_square(bbox_xy_to_wh(val), bbox_expansion=0.1) for key, val in seq_boxes.items() if 'hand' in key}
-# obj_bboxes = [seq_boxes['objects']]
-# # Initialize segmentation and hand pose estimation models
-# mask_extractor = MaskExtractor(pointrend_model_weights="/remote-home/jiangshijian/homan/external/model_final_edd263.pkl") # detectron2://PointRend/InstanceSegmentation/pointrend_rcnn_R_50_FPN_3x_coco/164955410/model_final_edd263.pkl
-# frankmocap_hand_checkpoint = "/remote-home/jiangshijian/homan/external/frankmocap/extra_data/hand_module/pretrained_weights/pose_shape_best.pth"
-# hand_predictor = HandMocap(frankmocap_hand_checkpoint, "extra_data/smpl")
-
+# read the corrspondence infos
+with open(os.path.join(data_root, seq_name, "correspondence", "data.json"), "rb") as f:
+    correspondence_info = json.load(f)
 # Define camera parameters
 height, width, _ = images_np[0].shape
 image_size = max(height, width)
@@ -155,29 +146,10 @@ camintrs = [camintr for _ in range(len(images_np))]
 obj_mask_infos: List
     full_mask: torch.bool H * W
 '''
-obj_mask_infos = process_masks_to_infos(obj_masks_np, hand_masks_np, flows_np)
-# person_parameters, _, _ = get_frame_infos(images_np,
-#                                                     mask_extractor=mask_extractor,
-#                                                     hand_predictor=hand_predictor,
-#                                                     hand_bboxes=hand_bboxes,
-#                                                     obj_bboxes=np.stack(obj_bboxes),
-#                                                     sample_folder=sample_folder,
-#                                                     camintr=camintrs,
-#                                                     image_size=image_size,
-#                                                     debug=False)
-# for idx, (person_parameter, hand_mask) in enumerate(zip(person_parameters, hand_masks_np)):
-#     hand_mask = (hand_mask == 255)
-#     device = person_parameter['masks'].device
-#     hand_mask = torch.from_numpy(hand_mask).unsqueeze(0).to(device)
-#     person_parameters[idx]['masks'] = hand_mask
-
-# frame_info = {"person_parameters": person_parameters[0], "obj_mask_infos": obj_mask_infos[0], "image": images_np[0]}
-# super2d_img = viz_frame_info(frame_info,
-#                                 sample_folder=sample_folder,
-#                                 save=False)
-# tmp_ = Image.fromarray(super2d_img)
-# tmp_.save(os.path.join(sample_folder, 'tmp_2d.png'))
-
+if flows_np[0] is not None:
+    obj_mask_infos = process_masks_to_infos(obj_masks_np, hand_masks_np, flows_np)
+else:
+    obj_mask_infos = process_masks_to_infos(obj_masks_np, hand_masks_np, None)
 from homan.pose_optimization import find_optimal_poses
 
 
@@ -199,18 +171,7 @@ object_parameters: List, len(images)
     rotations: 1*3*3
     translations: 1*1*3
 
-'''
-# for person_param, obj_param, camintr in zip(person_parameters,
-#                                         object_parameters,
-#                                         camintrs):
-    
-#     maskutils.add_target_hand_occlusions(
-#         person_param,
-#         obj_param,
-#         camintr,
-#         debug=False,
-#         sample_folder=sample_folder)
-    
+''' 
 from homan.viz.colabutils import display_video
 from homan.jointopt import optimize_hand_object, optimize_object
 
@@ -218,19 +179,12 @@ coarse_num_iterations = 201 # Increase to give more steps to converge
 coarse_viz_step = 10 # Decrease to visualize more optimization steps
 
 coarse_loss_weights = {
-        "lw_inter": 0,
-        "lw_depth": 0,
         "lw_sil_obj": 1.0,
-        "lw_sil_hand": 0.0,
-        "lw_collision": 0.0,
-        "lw_contact": 0.0,
-        "lw_scale_hand": 0.000,
         "lw_scale_obj": 0.000,
-        "lw_v2d_hand": 00,
-        "lw_smooth_hand": 0000,
-        "lw_smooth_obj": 1.0,
-        "lw_pca": 0.000,
-        "lw_flow_obj": 10.0
+        "lw_smooth_obj": 500.0,
+        "lw_flow_obj": 0.00,
+        "lw_edge_obj": 0.000,
+        "lw_correspondence_obj": 0.00
     }
 
 # Camera intrinsics in normalized coordinate
@@ -240,29 +194,10 @@ camintr_nc[:, :2] = camintr_nc[:, :2] / image_size
 step2_folder = os.path.join(sample_folder, "jointoptim_step2")
 step2_viz_folder = os.path.join(step2_folder, "viz")
 
-# Coarse hand-object fitting
-# model, loss_evolution, imgs = optimize_hand_object(
-#     person_parameters=person_parameters,
-#     object_parameters=object_parameters,
-#     hand_proj_mode="persp",
-#     objvertices=obj_verts_can,
-#     objfaces=np.stack([obj_faces for _ in range(len(images_np))]),
-#     optimize_mano=False,
-#     optimize_mano_beta=False,
-#     optimize_object_scale=optim_obj_scale,
-#     loss_weights=coarse_loss_weights,
-#     image_size=image_size,
-#     num_iterations=coarse_num_iterations + 1,  # Increase to get more accurate initializations
-#     images=np.stack(images_np),
-#     camintr=camintr_nc,
-#     state_dict=None,
-#     viz_step=coarse_viz_step,
-#     viz_folder=step2_viz_folder,
-# )
-
 model, loss_evolution, imgs = optimize_object(
     object_parameters=object_parameters,
     objvertices=obj_verts_can,
+    correspondence_info = correspondence_info,
     objfaces=np.stack([obj_faces for _ in range(len(images_np))]),
     optimize_object_scale=optim_obj_scale,
     loss_weights=coarse_loss_weights,
@@ -273,6 +208,7 @@ model, loss_evolution, imgs = optimize_object(
     state_dict=None,
     viz_step=coarse_viz_step,
     viz_folder=step2_viz_folder,
+    board = board,
 )
 '''
 Parameter Lists:
