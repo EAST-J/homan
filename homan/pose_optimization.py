@@ -331,7 +331,7 @@ def find_optimal_pose(
         translation_init=translations_init,
         num_initializations=num_initializations,
         K=camintr_roi,
-        lw_chamfer=0.0, # TODO: 考虑是否加入chamfer的损失项
+        lw_chamfer=0.0,
     )
     model.cuda()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)

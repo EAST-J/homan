@@ -24,7 +24,7 @@ from handmocap.hand_mocap_api import HandMocap
 from homan.viz.vizframeinfo import viz_frame_info
 from homan.lib2d import maskutils
 import cv2
-from torchvision import transforms
+from homan.utils.geometry import rot6d_to_matrix
 from tensorboardX import SummaryWriter
 import json
 
@@ -172,8 +172,25 @@ object_parameters: List, len(images)
     translations: 1*1*3
 
 ''' 
-from homan.viz.colabutils import display_video
-from homan.jointopt import optimize_hand_object, optimize_object
+for idx, obj_param in enumerate(object_parameters):
+    obj_rot = obj_param["rotations"].transpose(1, 2)
+    obj_trans = obj_param["translations"]
+
+    obj_rot_np = obj_rot.detach().cpu().numpy()
+    obj_trans_np = obj_trans.detach().cpu().numpy()
+    K = np.array([[focal, 0, width//2],
+                [0, focal, height//2],
+                [0, 0, 1]])
+    os.makedirs(os.path.join(sample_folder, "init_obj_infos"), exist_ok=True)
+    data = {
+        "R": obj_rot_np[0],
+        "T": obj_trans_np[0],
+        "K": K,
+    }
+    np.savez(os.path.join(sample_folder, "init_obj_infos/{:04d}.npz".format(idx)), **data)
+
+
+from homan.jointopt import optimize_object
 
 coarse_num_iterations = 201 # Increase to give more steps to converge
 coarse_viz_step = 10 # Decrease to visualize more optimization steps
@@ -181,9 +198,9 @@ coarse_viz_step = 10 # Decrease to visualize more optimization steps
 coarse_loss_weights = {
         "lw_sil_obj": 1.0,
         "lw_scale_obj": 0.000,
-        "lw_smooth_obj": 500.0,
-        "lw_flow_obj": 0.00,
-        "lw_edge_obj": 0.000,
+        "lw_smooth_obj": 100.0,
+        "lw_flow_obj": 0.0,
+        "lw_edge_obj": 0.0000,
         "lw_correspondence_obj": 0.00
     }
 
@@ -199,7 +216,7 @@ model, loss_evolution, imgs = optimize_object(
     objvertices=obj_verts_can,
     correspondence_info = correspondence_info,
     objfaces=np.stack([obj_faces for _ in range(len(images_np))]),
-    optimize_object_scale=optim_obj_scale,
+    optimize_object_scale=False,
     loss_weights=coarse_loss_weights,
     image_size=image_size,
     num_iterations=coarse_num_iterations + 1,  # Increase to get more accurate initializations
@@ -230,7 +247,6 @@ K: focal, 0, width//2
     0, focal, height//2
     0, 0, 1
 '''
-from homan.utils.geometry import rot6d_to_matrix
 from tqdm import tqdm
 obj_rot = rot6d_to_matrix(model.rotations_object).transpose(1, 2) # obj_coordinate to camera coordinate
 obj_trans = model.translations_object

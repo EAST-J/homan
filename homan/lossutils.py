@@ -20,6 +20,7 @@ def compute_smooth_loss(
     verts_hand=None,
 ):
     # Assumes a single obj
+    res_loss_dic = {}
     if verts_hand is not None:
         hand_nb = verts_hand.shape[0] // verts_obj.shape[0]
         time_hands = [verts_hand[hand_idx::hand_nb] for hand_idx in range(hand_nb)]
@@ -30,13 +31,14 @@ def compute_smooth_loss(
         # import pudb
         # pu.db
         smooth_loss_hand = ((all_hand_verts[1:] - all_hand_verts[:-1])**2).mean()
+        res_loss_dic.update({"loss_smooth_hand": smooth_loss_hand})
     else:
         smooth_loss_hand = torch.Tensor([0.0]).float().cuda()
     smooth_loss_obj = ((verts_obj[1:] - verts_obj[:-1])**2).mean()
-    return {
+    res_loss_dic.update({
         "loss_smooth_obj": smooth_loss_obj,
-        "loss_smooth_hand": smooth_loss_hand
-    }
+    })
+    return res_loss_dic
 
 
 def compute_pca_loss(mano_pca_comps):

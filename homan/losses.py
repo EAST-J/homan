@@ -15,6 +15,8 @@ from libyana import distutils
 from libyana.camutils import project
 from libyana.metrics.iou import batch_mask_iou
 from scipy.ndimage.morphology import distance_transform_edt
+import point_cloud_utils as pcu
+import numpy as np
 # from physim.datasets import collate
 
 
@@ -49,6 +51,58 @@ def project_bbox(vertices, renderer, bbox_expansion=0.0):
         bboxes_xy = torch.cat([center - extent, center + extent], 1)
     return bboxes_xy
 
+def interpolate_barycentric_coords(f, fi, bc, attribute):
+    """
+    Interpolate an attribute stored at each vertex of a mesh across the faces of a triangle mesh using
+    barycentric coordinates
+
+    Args:
+        f : a (#faces, 3)-shaped Tensor of mesh faces (indexing into some vertex array).
+        fi: a (#attribs,)-shaped Tensor of indexes into f indicating which face each attribute lies within.
+        bc: a (#attribs, 3)-shaped Tensor of barycentric coordinates for each attribute
+        attribute: a (#vertices, dim)-shaped Tensor of attributes at each of the mesh vertices
+
+    Returns:
+        A (#attribs, dim)-shaped array of interpolated attributes.
+    """
+    return (attribute[f[fi.to(torch.long)]] * bc[:, :, None]).sum(1)
+
+def get_rays(pixels_x, pixels_y, K_inv, c2w):
+    """
+    Generate the rays_o and rays_v
+    pixels_x: (N,) 
+    pixels_y: (N,)
+    K_inv: (3 * 3) The inverse matrix of the camera
+    c2w: (4 * 4) The transformation matrix from the camera coordinate to the world coordinate
+    """
+    pts = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float()  # batch_size, 3
+    pts = torch.matmul(pts, K_inv.T) # batch_size, 3
+    rays_d = pts / torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True)    # batch_size, 3
+    rays_d = torch.matmul(rays_d, c2w[:3, :3].T) # batch_size, 3
+    rays_o = c2w[:3, -1].expand(rays_d.shape) # batch_size, 3
+    return rays_o, rays_d
+
+def ray_mesh_intersect(obj_v, obj_f, rays_o, rays_d, transformation_matrix=None):
+    # ! 由于暂时没有找到differentiable的ray/mesh intersector的方案，故基于np完成，梯度借助于坐标系转换传播
+    '''
+    obj_v: V * 3 (Tensor Need to be calculate the loss)
+    obj_f: F * 3
+    rays_o: N * 3
+    rays_d: N * 3
+    '''
+    intersector = pcu.RayMeshIntersector(obj_v.detach().cpu().numpy(), obj_f.detach().cpu().numpy())
+    fid, bc, t = intersector.intersect_rays(rays_o.detach().cpu().numpy().astype(np.float32), 
+                                            rays_d.detach().cpu().numpy().astype(np.float32))
+    hit_mask = np.isfinite(t)
+    # The hit pose are in the camera-coordinate (need to be transform back to the object)
+    hit_pos = interpolate_barycentric_coords(obj_f, torch.from_numpy(fid[hit_mask]).to(obj_v.device), 
+                                            torch.from_numpy(bc[hit_mask]).to(obj_v.device), obj_v)
+    if transformation_matrix is not None:
+        hit_pos = hit_pos @ transformation_matrix[:3, :3].T + transformation_matrix[:3, -1:].T
+    hit_mask = torch.from_numpy(hit_mask).to(hit_pos.device)
+    hit_pose_full = torch.zeros((rays_o.shape[0], 3)).to(hit_pos.device)
+    hit_pose_full[hit_mask] = hit_pos
+    return hit_pose_full, hit_mask
 
 class Losses_Obj():
     def __init__(
@@ -134,7 +188,7 @@ class Losses_Obj():
         loss_sil += l_m
         ious = batch_mask_iou(image, self.ref_mask_object)
         l_chamfer = torch.sum(self.compute_edges(image) * self.edt_ref_edge)
-        l_chamfer += 1000 * self.compute_offscreen_loss(verts)
+        l_chamfer += 100000 * self.compute_offscreen_loss(verts)
         return {
             "loss_sil_obj": loss_sil / len(verts), 
             "loss_edge_obj": l_chamfer,
@@ -142,12 +196,69 @@ class Losses_Obj():
             'iou_object': ious.mean().item()
         }
 
-    def compute_correspondence_loss(self, rotation_obj, translation_obj, correspondence_frame_idxs, correspondence_uvs):
-        rot1, rot2 = rotation_obj[correspondence_frame_idxs[:, 0]], rotation_obj[correspondence_frame_idxs[:, 1]]
-        trans1, trans2 = translation_obj[correspondence_frame_idxs[:, 0]], translation_obj[correspondence_frame_idxs[:, 1]]
-        # TODO：设计loss，如何利用correspondence信息
-
-        pass
+    def compute_correspondence_loss(self, verts, faces, rotation_obj, translation_obj, correspondence_frame_idxs, correspondence_uvs):
+        """
+        verts: B * V * 3
+        faces: B * F * 3
+        rotation_obj: B * 3 * 3
+        translation_obj: B * 1 * 3
+        correspondence_frame_idxs: N * 2 对应图像的索引
+        correspondence_uvs: N * 2 * 5 * 2 对应匹配点的坐标,暂时指定为5个匹配点
+        """
+        # back transform the camera matrix
+        K = self.camintr[0].clone().detach()
+        image_size = max(self.full_mask_object.shape[1], self.full_mask_object.shape[2])
+        K[:2] = K[:2] * image_size
+        K_inv = torch.linalg.inv(K)
+        obj_f = faces[0] # F * 3
+        rot1, rot2 = rotation_obj[correspondence_frame_idxs[:, 0]], rotation_obj[correspondence_frame_idxs[:, 1]] # N * 3 * 3
+        trans1, trans2 = translation_obj[correspondence_frame_idxs[:, 0]], translation_obj[correspondence_frame_idxs[:, 1]] # N * 1 * 3
+        pixels_x1, pixels_x2 = correspondence_uvs[:, 0, :, 0], correspondence_uvs[:, 1, :, 0] # N * Point_Num
+        pixels_y1, pixels_y2 = correspondence_uvs[:, 0, :, 1], correspondence_uvs[:, 1, :, 1] # N * Point_Num
+        rays_o1, rays_d1 = get_rays(pixels_x1.reshape(-1), pixels_y1.reshape(-1), K_inv, torch.eye(4).to(K_inv.device)) # (N * Point_Num) * 3
+        rays_o2, rays_d2 = get_rays(pixels_x2.reshape(-1), pixels_y2.reshape(-1), K_inv, torch.eye(4).to(K_inv.device))
+        rays_o1, rays_o2 = rays_o1.reshape(-1, pixels_x1.shape[1], 3), rays_o2.reshape(-1, pixels_x1.shape[1], 3) # N * Point_Num * 3
+        rays_d1, rays_d2 = rays_d1.reshape(-1, pixels_x1.shape[1], 3), rays_d2.reshape(-1, pixels_x1.shape[1], 3)
+        hit_pos1 = []
+        hit_pos2 = []
+        hit_mask1 = []
+        hit_mask2 = []
+        # TODO: 处理没有hit的点
+        for n_idx in range(rot1.shape[0]): # 0 ~ N-1
+            verts1, verts2 = verts[correspondence_frame_idxs[n_idx, 0]], verts[correspondence_frame_idxs[n_idx, 1]]
+            matrix1 = torch.cat([rot1[n_idx], trans1[n_idx].reshape(3, 1)], dim=1)
+            matrix1 = torch.cat([matrix1, torch.tensor([[0, 0, 0, 1.]]).to(matrix1.device)])
+            hit_pos1_, hit_mask1_ = ray_mesh_intersect(verts1, obj_f, rays_o1[n_idx], rays_d1[n_idx], torch.linalg.inv(matrix1))
+            matrix2 = torch.cat([rot2[n_idx], trans2[n_idx].reshape(3, 1)], dim=1)
+            matrix2 = torch.cat([matrix2, torch.tensor([[0, 0, 0, 1.]]).to(matrix2.device)])
+            hit_pos2_, hit_mask2_ = ray_mesh_intersect(verts2, obj_f, rays_o2[n_idx], rays_d2[n_idx], torch.linalg.inv(matrix2))
+            # transform back to other camera coordinate
+            hit_pos1_2 = hit_pos1_ @ matrix2[:3, :3].T + matrix2[:3, -1].view(1, 3)
+            hit_pos2_1 = hit_pos2_ @ matrix1[:3, :3].T + matrix1[:3, -1].view(1, 3)
+            hit_pos1.append(hit_pos1_2)
+            hit_mask1.append(hit_mask1_)
+            hit_pos2.append(hit_pos2_1)
+            hit_mask2.append(hit_mask2_)
+        hit_pos1 = torch.cat(hit_pos1)
+        hit_pos2 = torch.cat(hit_pos2)
+        hit_mask1 = torch.cat(hit_mask1)
+        hit_mask2 = torch.cat(hit_mask2)
+        hit_uv1 = hit_pos1 @ K.T
+        hit_uv1 = hit_uv1[:, :2] / hit_uv1[:, 2:]
+        hit_uv2 = hit_pos2 @ K.T
+        hit_uv2 = hit_uv2[:, :2] / hit_uv2[:, 2:]
+        gt_uv2 = torch.cat([pixels_x2.reshape(-1, 1), pixels_y2.reshape(-1, 1)], dim=1).float()
+        gt_uv1 = torch.cat([pixels_x1.reshape(-1, 1), pixels_y1.reshape(-1, 1)], dim=1).float()
+        # normalize the coordinate
+        hit_uv1[:, 0] /= self.full_mask_object.shape[2]; hit_uv1[:, 1] /= self.full_mask_object.shape[1]
+        hit_uv2[:, 0] /= self.full_mask_object.shape[2]; hit_uv2[:, 1] /= self.full_mask_object.shape[1]
+        gt_uv1[:, 0] /= self.full_mask_object.shape[2]; gt_uv1[:, 1] /= self.full_mask_object.shape[1]
+        gt_uv2[:, 0] /= self.full_mask_object.shape[2]; gt_uv2[:, 1] /= self.full_mask_object.shape[1]
+        correspondence_loss = torch.sum((hit_uv1 - gt_uv2)**2 * hit_mask1.reshape(-1, 1)) + \
+                                torch.sum((hit_uv2 - gt_uv1)**2 * hit_mask2.reshape(-1, 1))
+        return {
+            "loss_correspondence_obj": correspondence_loss
+        }
 
     def compute_flow_loss(self, verts, faces):
         """

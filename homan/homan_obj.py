@@ -156,7 +156,7 @@ class HOMan_Obj(nn.Module):
         self.correspondence_frame_idxs = correspondence_info["frame_infos"]
         self.correspondence_frame_idxs = torch.tensor(self.correspondence_frame_idxs).to(self.translations_object.device) # N * 2
         self.correspondence_uvs = correspondence_info["correspondence_points"]
-        self.correspondence_uvs = torch.tensor(self.correspondence_uvs).to(self.translations_object.device) # N * 2 * 5 * 2
+        self.correspondence_uvs = torch.tensor(self.correspondence_uvs).to(self.translations_object.device) # N * 2 * Point_num * 2
 
 
     def get_verts_object(self):
@@ -191,7 +191,9 @@ class HOMan_Obj(nn.Module):
             loss_dict.update(flow_loss_dict)
         if loss_weights is None or loss_weights["lw_correspondence_obj"] > 0:
             correspondence_loss_dict = self.losses.compute_correspondence_loss(
-                rotation_obj=rot6d_to_matrix(self.obj_rot_mult *self.rotations_object), 
+                verts=verts_object,
+                faces=self.faces_object,
+                rotation_obj=rot6d_to_matrix(self.obj_rot_mult * self.rotations_object).transpose(1, 2), 
                 translation_obj=self.translations_object,
                 correspondence_frame_idxs=self.correspondence_frame_idxs, correspondence_uvs=self.correspondence_uvs)
             loss_dict.update(correspondence_loss_dict)
@@ -206,8 +208,8 @@ class HOMan_Obj(nn.Module):
                     intrinsic_scales=self.int_scales_object,
                     intrinsic_mean=self.int_scale_object_mean,
                 )
-        if loss_weights is None or loss_weights["lw_depth"] > 0:
-            loss_dict.update(lossutils.compute_ordinal_depth_loss())
+        # if loss_weights is None or loss_weights["lw_depth"] > 0:
+        #     loss_dict.update(lossutils.compute_ordinal_depth_loss())
         return loss_dict, metric_dict
 
     def render_limem(self,

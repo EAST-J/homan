@@ -210,7 +210,7 @@ def optimize_object(
     correspondence_info=None,
     loss_weights=None,
     num_iterations=400,
-    lr=1e-4,
+    lr=1e-3,
     board=None,
     images=None,
     viz_step=10,
@@ -330,7 +330,7 @@ def optimize_object(
     np2vid.make_video(optim_imgs,
                       front_top_path.replace(".jpg", f"{fps}.gif"),
                       fps=fps)
-    video_path = os.path.join(os.path.dirname(viz_folder), "joint_optim.webm")
-    np2vid.make_video(optim_imgs, video_path, fps=fps)
-    np2vid.make_video(optim_imgs, video_path.replace(".webm", ".mp4"), fps=fps)
+    # video_path = os.path.join(os.path.dirname(viz_folder), "joint_optim.webm")
+    # np2vid.make_video(optim_imgs, video_path, fps=fps)
+    # np2vid.make_video(optim_imgs, video_path.replace(".webm", ".mp4"), fps=fps)
     return model, dict(loss_evolution), imgs
