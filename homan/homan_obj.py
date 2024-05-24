@@ -31,6 +31,7 @@ class HOMan_Obj(nn.Module):
         verts_object_og,
         faces_object,
         masks_object,
+        depths_object,
         camintr_rois_object,
         target_masks_object,
         flow_object,
@@ -78,6 +79,7 @@ class HOMan_Obj(nn.Module):
                              flow_object.float())
         self.register_buffer("camintr_rois_object", camintr_rois_object)
         self.register_buffer("faces_object", faces_object)
+        self.register_buffer("depths_object", depths_object)
         if optimize_object_texture:
             self.textures_object = nn.Parameter(
                 torch.ones(1, faces_object.shape[1], 1, 1, 1, 3),
@@ -146,6 +148,7 @@ class HOMan_Obj(nn.Module):
             keep_mask_object=self.keep_mask_object,
             full_mask_object=self.masks_object,
             flow_object=self.flow_object,
+            depth_object=self.depths_object,
             camintr_rois_object=self.camintr_rois_object,
             camintr=self.camintr,
             class_name=class_name,
@@ -153,10 +156,14 @@ class HOMan_Obj(nn.Module):
         )
         verts_object_init, _ = self.get_verts_object()
         self.verts_object_init = verts_object_init.detach().clone()
-        self.correspondence_frame_idxs = correspondence_info["frame_infos"]
-        self.correspondence_frame_idxs = torch.tensor(self.correspondence_frame_idxs).to(self.translations_object.device) # N * 2
-        self.correspondence_uvs = correspondence_info["correspondence_points"]
-        self.correspondence_uvs = torch.tensor(self.correspondence_uvs).to(self.translations_object.device) # N * 2 * Point_num * 2
+        if correspondence_info is not None:
+            self.correspondence_frame_idxs = correspondence_info["frame_infos"]
+            self.correspondence_frame_idxs = torch.tensor(self.correspondence_frame_idxs).to(self.translations_object.device) # N * 2
+            self.correspondence_uvs = correspondence_info["correspondence_points"]
+            self.correspondence_uvs = torch.tensor(self.correspondence_uvs).to(self.translations_object.device) # N * 2 * Point_num * 2
+        else:
+            self.correspondence_frame_idxs = None
+            self.correspondence_uvs = None
 
 
     def get_verts_object(self):
@@ -189,7 +196,7 @@ class HOMan_Obj(nn.Module):
             flow_loss_dict = self.losses.compute_flow_loss(
                 verts=verts_object, faces=self.faces_object)
             loss_dict.update(flow_loss_dict)
-        if loss_weights is None or loss_weights["lw_correspondence_obj"] > 0:
+        if loss_weights is None or loss_weights["lw_correspondence_obj"] > 0 and self.correspondence_frame_idxs is not None:
             correspondence_loss_dict = self.losses.compute_correspondence_loss(
                 verts=verts_object,
                 faces=self.faces_object,
@@ -202,6 +209,11 @@ class HOMan_Obj(nn.Module):
                 verts=verts_object, faces=self.faces_object)
             loss_dict.update(sil_loss_dict)
             metric_dict.update(sil_metric_dict)
+        if loss_weights is None or loss_weights["lw_depth_obj"] > 0:
+            depth_loss_dict = self.losses.compute_depth_loss(
+                verts=verts_object,
+                faces=self.faces_object)
+            loss_dict.update(depth_loss_dict)
         if loss_weights is None or loss_weights["lw_scale_obj"] > 0:
             loss_dict[
                 "loss_scale_obj"] = lossutils.compute_intrinsic_scale_prior(

@@ -492,6 +492,90 @@ def find_optimal_poses(image_size,
             final_params[key] = obj_params[key].unsqueeze(0).cuda()
         if "flows" in obj_params.keys():
             final_params["flows"] = obj_params["flows"].unsqueeze(0).cuda()
+        if "depths" in info.keys():
+            final_params["depths"] = torch.from_numpy(info["depths"]).unsqueeze(0).cuda()
+        final_params["full_mask"] = info["full_mask"].cuda()
+        all_final_params.append(final_params)
+    return all_final_params
+
+
+def find_optimal_poses_indiviual(image_size,
+                       faces=None,
+                       vertices=None,
+                       annotations=None,
+                       images=None,
+                       Ks=None,
+                       num_iterations=50,
+                       num_initializations=2000,
+                       viz_path="tmp.png",
+                       debug=False):
+    """
+    
+    """
+    # Check input shapes
+    checkshape.check_shape(faces, (-1, 3), "faces")
+    checkshape.check_shape(vertices, (-1, 3), "vertices")
+
+    # Convert inputs to tensors
+    vertices = npt.tensorify(vertices).cuda()
+    faces = npt.tensorify(faces).cuda()
+
+    # Keep track of previous rotations to get temporally consistent initialization
+    previous_rotations = None
+    all_object_parameters = []
+    all_losses = []
+    for image, annotation, K in zip(images, annotations, Ks):
+        # Optimize pose to given mask evidence
+        model = find_optimal_pose(
+            vertices=vertices,
+            faces=faces,
+            image=image,
+            mask=annotation["target_crop_mask"],
+            bbox=annotation["bbox"],
+            square_bbox=annotation["square_bbox"],
+            image_size=image_size,
+            K=K,
+            num_iterations=num_iterations,
+            num_initializations=num_initializations,
+            debug=debug,
+            viz_folder=os.path.dirname(viz_path),
+            sort_best=False,  # Keep initial ordering
+            rotations_init=previous_rotations,
+        )
+        _, iou, _ = model()
+        best_idx = torch.argsort(iou)[-1]
+        verts_trans = model.apply_transformation()
+        object_parameters = {
+            "rotations": rot6d_to_matrix(model.rotations).detach()[best_idx],
+            "translations": model.translations.detach()[best_idx],
+            "target_masks":
+            torch.from_numpy(annotation["target_crop_mask"]).cuda(),
+            "K_roi": model.K.detach(),
+            "masks": annotation["full_mask"].cuda(),
+            "verts": vertices.detach(),
+            "verts_trans": verts_trans.detach()[best_idx],
+        }
+        if "flow" in annotation.keys(): # 最后一帧没有光流的监督
+            object_parameters.update({"flows": torch.from_numpy(annotation["flow"]).cuda()})
+        all_object_parameters.append(object_parameters)
+        # TODO: 考虑使用那种方式指定previous_rotations
+        previous_rotations = rot6d_to_matrix(model.rotations.detach())
+        # previous_rotations = rot6d_to_matrix(model.rotations.detach()[best_idx:best_idx+1].repeat(num_initializations, 1, 1))  # num_initializations, 3, 2 rot6d rotations
+    all_final_params = []
+    # Aggregate object pose candidates for all frames
+    for obj_params, info in zip(all_object_parameters, annotations):
+        final_params = {}
+        # Get best parameters
+        for key in ["rotations", "translations", "verts_trans"]:
+            final_params[key] = obj_params[key].unsqueeze(0).cuda()
+
+        # Copy useful mask information
+        for key in ["target_masks", "K_roi", "masks", "verts"]:
+            final_params[key] = obj_params[key].unsqueeze(0).cuda()
+        if "flows" in obj_params.keys():
+            final_params["flows"] = obj_params["flows"].unsqueeze(0).cuda()
+        if "depths" in info.keys():
+            final_params["depths"] = torch.from_numpy(info["depths"]).unsqueeze(0).cuda()
         final_params["full_mask"] = info["full_mask"].cuda()
         all_final_params.append(final_params)
     return all_final_params

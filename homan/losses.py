@@ -112,6 +112,7 @@ class Losses_Obj():
         keep_mask_object,
         full_mask_object,
         flow_object,
+        depth_object,
         camintr_rois_object,
         camintr,
         class_name,
@@ -133,8 +134,9 @@ class Losses_Obj():
         self.keep_mask_object = keep_mask_object
         self.camintr_rois_object = camintr_rois_object
         self.full_mask_object = full_mask_object
+        self.depth_object = depth_object
         self.flow_object = flow_object # (bs-1) *  H * W
-        # Necessary ! Otherwise camintr gets updated for some reason TODO check
+        # Necessary ! Otherwise camintr gets updated for some reason
         self.camintr = camintr.clone()
         self.thresh = 3  # z thresh for interaction loss
         self.mse = torch.nn.MSELoss()
@@ -223,7 +225,6 @@ class Losses_Obj():
         hit_pos2 = []
         hit_mask1 = []
         hit_mask2 = []
-        # TODO: 处理没有hit的点
         for n_idx in range(rot1.shape[0]): # 0 ~ N-1
             verts1, verts2 = verts[correspondence_frame_idxs[n_idx, 0]], verts[correspondence_frame_idxs[n_idx, 1]]
             matrix1 = torch.cat([rot1[n_idx], trans1[n_idx].reshape(3, 1)], dim=1)
@@ -260,6 +261,26 @@ class Losses_Obj():
             "loss_correspondence_obj": correspondence_loss
         }
 
+    def compute_depth_loss(self, verts, faces):
+        rend_depth = self.renderer(verts, faces, mode="depth") # bs * 256 * 256
+        rend_sil = self.renderer(verts, faces, mode="silhouettes")
+        rend_depth_min = torch.min(rend_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
+        rend_depth[rend_sil!=1] = -1
+        rend_depth_max = torch.max(rend_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1) # bs * 1
+        # 背景值为0 (只获取物体的相对深度，以物体距离相机最远的点为基准)
+        normalized_rend_depth = (rend_depth_max - rend_depth) / (rend_depth_max - rend_depth_min)
+        normalized_rend_depth[rend_sil!=1] = 0
+        normalized_rend_depth = F.interpolate(normalized_rend_depth.unsqueeze(1), 
+                                              size=(self.depth_object.shape[1], self.depth_object.shape[2])).squeeze(1) # bs * 480 * 640
+        gt_depth_min = torch.min(self.depth_object.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
+        gt_depth_max = torch.max(self.depth_object.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
+        normalized_gt_depth = (self.depth_object - gt_depth_min) / (gt_depth_max - gt_depth_min)
+        depth_loss = torch.sum(
+            (normalized_rend_depth - normalized_gt_depth)**2 * self.full_mask_object) / self.full_mask_object.sum()
+        return {
+            "loss_depth_obj": depth_loss
+        }
+
     def compute_flow_loss(self, verts, faces):
         """
         verts: B * V * 3
@@ -273,7 +294,6 @@ class Losses_Obj():
         former_uv = uv[:-1].detach()
         pred_flow = uv[1:] - former_uv # bs * N * 2
         flow_mask = torch.zeros((verts.shape[0] - 1, verts.shape[1])).to(verts.device)
-        # TODO: 能否优化不使用for循环
         for i in range(face_visibility.shape[0] - 1):
             obj_vis_v_idx = faces[0, torch.logical_and(face_visibility[i], face_visibility[i+1])].reshape(-1)
             flow_mask[i][torch.unique(obj_vis_v_idx)] = 1
@@ -345,7 +365,7 @@ class Losses():
         self.ref_verts2d_hand = ref_verts2d_hand
         self.keep_mask_hand = keep_mask_hand
         self.camintr_rois_hand = camintr_rois_hand
-        # Necessary ! Otherwise camintr gets updated for some reason TODO check
+        # Necessary ! Otherwise camintr gets updated for some reason
         self.camintr = camintr.clone()
         self.thresh = 3  # z thresh for interaction loss
         self.mse = torch.nn.MSELoss()
@@ -418,7 +438,7 @@ class Losses():
         ).sum(-1).mean()
         verts2d_dist = (pred_verts_proj * image_size -
                         self.ref_verts2d_hand).norm(2, -1).mean()
-        # HACK TODO beautify, discard hands that are too small !
+        #  beautify, discard hands that are too small !
         return {
             "loss_v2d_hand": verts2d_loss
         }, {
@@ -432,7 +452,7 @@ class Losses():
             camintr = self.camintr_rois_hand[i]
             # Rendering happens in ROI
             rend = self.renderer(
-                verts,  # TODO check why not verts[i]
+                verts,  # check why not verts[i]
                 faces[i],
                 K=camintr.unsqueeze(0),
                 mode="silhouettes")
