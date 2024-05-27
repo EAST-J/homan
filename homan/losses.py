@@ -262,23 +262,26 @@ class Losses_Obj():
         }
 
     def compute_depth_loss(self, verts, faces):
-        rend_depth = self.renderer(verts, faces, mode="depth") # bs * 256 * 256
-        rend_sil = self.renderer(verts, faces, mode="silhouettes")
+        camintr = self.camintr_rois_object
+        rend_depth = self.renderer(verts, faces, K=camintr, mode="depth") # bs * 256 * 256
+        rend_sil = self.keep_mask_object * self.renderer(verts, faces, K=camintr, mode="silhouettes")
+        rend_depth[rend_sil!=1] = 100
         rend_depth_min = torch.min(rend_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
         rend_depth[rend_sil!=1] = -1
-        rend_depth_max = torch.max(rend_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1) # bs * 1
+        rend_depth_max = torch.max(rend_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1) # bs * 1 * 1
         # 背景值为0 (只获取物体的相对深度，以物体距离相机最远的点为基准)
         normalized_rend_depth = (rend_depth_max - rend_depth) / (rend_depth_max - rend_depth_min)
         normalized_rend_depth[rend_sil!=1] = 0
-        normalized_rend_depth = F.interpolate(normalized_rend_depth.unsqueeze(1), 
-                                              size=(self.depth_object.shape[1], self.depth_object.shape[2])).squeeze(1) # bs * 480 * 640
-        gt_depth_min = torch.min(self.depth_object.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
-        gt_depth_max = torch.max(self.depth_object.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
-        normalized_gt_depth = (self.depth_object - gt_depth_min) / (gt_depth_max - gt_depth_min)
+        gt_depth = self.depth_object.clone()
+        gt_depth[self.keep_mask_object!=1] = 1e6
+        gt_depth_min = torch.min(gt_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
+        gt_depth[self.keep_mask_object!=1] = -1
+        gt_depth_max = torch.max(gt_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
+        normalized_gt_depth = (gt_depth - gt_depth_min) / (gt_depth_max - gt_depth_min)
         depth_loss = torch.sum(
-            (normalized_rend_depth - normalized_gt_depth)**2 * self.full_mask_object) / self.full_mask_object.sum()
+            (normalized_rend_depth - normalized_gt_depth)**2) / self.keep_mask_object.sum()
         return {
-            "loss_depth_obj": depth_loss
+            "loss_depth_obj": depth_loss / len(verts)
         }
 
     def compute_flow_loss(self, verts, faces):

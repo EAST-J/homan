@@ -44,6 +44,7 @@ class PoseOptimizer(nn.Module):
     def __init__(
         self,
         ref_image,
+        depth,
         vertices,
         faces,
         textures,
@@ -68,10 +69,13 @@ class PoseOptimizer(nn.Module):
         # Convention for silhouette-aware loss: -1=occlusion, 0=bg, 1=fg.
         image_ref = torch.from_numpy((ref_image > 0).astype(np.float32)) # 物体的分割部分
         keep_mask = torch.from_numpy((ref_image >= 0).astype(np.float32)) # 除了被遮挡的部分，即用来计算loss的部分
+        depth = torch.from_numpy(depth.astype(np.float32))
         self.register_buffer("image_ref",
                              image_ref.repeat(num_initializations, 1, 1))
         self.register_buffer("keep_mask",
                              keep_mask.repeat(num_initializations, 1, 1))
+        self.register_buffer("depth", 
+                             depth[None, :, :].repeat(num_initializations, 1, 1))
         self.pool = torch.nn.MaxPool2d(kernel_size=kernel_size,
                                        stride=1,
                                        padding=(kernel_size // 2))
@@ -137,17 +141,41 @@ class PoseOptimizer(nn.Module):
     def compute_edges(self, silhouette):
         return self.pool(silhouette) - silhouette
 
+    def comput_depth_loss(self, verts, faces):
+        rend_depth = self.renderer(verts, faces, mode="depth") # bs * 256 * 256
+        rend_sil = self.keep_mask * self.renderer(verts, faces, mode="silhouettes")
+        rend_depth[rend_sil!=1] = 100
+        rend_depth_min = torch.min(rend_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
+        rend_depth[rend_sil!=1] = -1
+        rend_depth_max = torch.max(rend_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1) # bs * 1 * 1
+        # 背景值为0 (只获取物体的相对深度，以物体距离相机最远的点为基准)
+        normalized_rend_depth = (rend_depth_max - rend_depth) / (rend_depth_max - rend_depth_min)
+        normalized_rend_depth[rend_sil!=1] = 0
+        gt_depth = self.depth.clone()
+        gt_depth[self.image_ref!=1] = 1e6
+        gt_depth_min = torch.min(gt_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
+        gt_depth[self.image_ref!=1] = -1
+        gt_depth_max = torch.max(gt_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
+        normalized_gt_depth = (gt_depth - gt_depth_min) / (gt_depth_max - gt_depth_min)
+        normalized_gt_depth[self.image_ref!=1] = 0
+        # depth_loss = torch.sum(
+        #     (normalized_rend_depth - normalized_gt_depth)**2 * self.image_ref) / self.image_ref.sum()
+        depth_loss = torch.sum(
+            (normalized_rend_depth - normalized_gt_depth)**2, dim=(1, 2))
+        return depth_loss
+
     def forward(self):
         verts = self.apply_transformation()
         image = self.keep_mask * self.renderer(
             verts, self.faces, mode="silhouettes") # 渲染物体3D Model所获得的mask(手部部分会被自动mask掉)
         loss_dict = {}
         loss_dict["mask"] = torch.sum((image - self.image_ref)**2, dim=(1, 2))
+        loss_dict["depth"] = self.comput_depth_loss(verts, self.faces)
         with torch.no_grad():
             iou = ioumetrics.batch_mask_iou(image.detach(),
                                             self.image_ref.detach())
-        loss_dict["chamfer"] = self.lw_chamfer * torch.sum(
-            self.compute_edges(image) * self.edt_ref_edge, dim=(1, 2)) # 渲染的边缘到真值边缘的距离和
+        # loss_dict["chamfer"] = self.lw_chamfer * torch.sum(
+        #     self.compute_edges(image) * self.edt_ref_edge, dim=(1, 2)) # 渲染的边缘到真值边缘的距离和
         loss_dict["offscreen"] = 100000 * self.compute_offscreen_loss(verts)
         return loss_dict, iou, image
 
@@ -224,6 +252,7 @@ def find_optimal_pose(
     bbox,
     square_bbox,
     image_size,
+    depth,
     K=None,
     num_iterations=50,
     num_initializations=2000,
@@ -253,8 +282,6 @@ def find_optimal_pose(
     best_rots = None
     best_trans = None
     best_loss_single = np.inf
-    best_rots_single = None
-    best_trans_single = None
     loop = tqdm(total=num_iterations)
     K = npt.tensorify(K).unsqueeze(0).to(vertices.device)
     # Mask is in format 256 x 256 (REND_SIZE x REND_SIZE)
@@ -276,54 +303,13 @@ def find_optimal_pose(
     translations_init = TCO_init_from_boxes_zup_autodepth(
         bbox, torch.matmul(vertices.unsqueeze(0), rotations_init),
         K).unsqueeze(1)
-    # if debug:
-    #     trans_verts = translations_init + torch.matmul(vertices,
-    #                                                    rotations_init)
-    #     proj_verts = project.batch_proj2d(trans_verts,
-    #                                       K.repeat(trans_verts.shape[0], 1,
-    #                                                1)).cpu()
-    #     verts3d = trans_verts.cpu()
-    #     flat_verts = proj_verts.contiguous().view(-1, 2)
-        # if viz:
-        #     plt.clf()
-        #     fig, axes = plt.subplots(1, 3)
-        #     ax = axes[0]
-        #     ax.imshow(image)
-        #     ax.scatter(flat_verts[:, 0], flat_verts[:, 1], s=1, alpha=0.2)
-        #     ax = axes[1]
-        #     ax.imshow(image)
-        #     for vert in proj_verts:
-        #         ax.scatter(vert[:, 0], vert[:, 1], s=1, alpha=0.2)
-        #     ax = axes[2]
-        #     for vert in verts3d:
-        #         ax.scatter(vert[:, 0], vert[:, 2], s=1, alpha=0.2)
-
-        #     fig.savefig(os.path.join(viz_folder, "autotrans.png"))
-        #     plt.close()
-
-        # proj_verts = project.batch_proj2d(
-        #     trans_verts, camintr_roi.repeat(trans_verts.shape[0], 1, 1)).cpu()
-        # flat_verts = proj_verts.contiguous().view(-1, 2)
-        # if viz:
-        #     fig, axes = plt.subplots(1, 3)
-        #     ax = axes[0]
-        #     ax.imshow(mask)
-        #     ax.scatter(flat_verts[:, 0], flat_verts[:, 1], s=1, alpha=0.2)
-        #     ax = axes[1]
-        #     ax.imshow(mask)
-        #     for vert in proj_verts:
-        #         ax.scatter(vert[:, 0], vert[:, 1], s=1, alpha=0.2)
-        #     ax = axes[2]
-        #     for vert in verts3d:
-        #         ax.scatter(vert[:, 0], vert[:, 2], s=1, alpha=0.2)
-        #     fig.savefig(os.path.join(viz_folder, "autotrans_roi.png"))
-        #     plt.close()
 
     # Bring crop K to NC rendering space
     camintr_roi[:, :2] = camintr_roi[:, :2] / REND_SIZE
 
     model = PoseOptimizer(
         ref_image=mask,
+        depth=depth,
         vertices=vertices,
         faces=faces,
         textures=textures,
@@ -346,20 +332,11 @@ def find_optimal_pose(
         if debug and (step % viz_step == 0):
             debug_viz_folder = os.path.join(viz_folder, "poseoptim")
             os.makedirs(debug_viz_folder, exist_ok=True)
-            # imagify.viz_imgrow(sil,
-            #                    overlays=[
-            #                        mask,
-            #                    ] * len(sil),
-            #                    viz_nb=4,
-            #                    path=os.path.join(debug_viz_folder,
-            #                                      f"{step:04d}.png"))
             if losses.min() < best_loss_single:
                 best_sil = sil[ind].clone().detach().cpu().numpy()
                 vis_mask = np.hstack([best_sil, mask])
                 cv2.imwrite(os.path.join(debug_viz_folder,f"{step:04d}.png"), vis_mask * 255)
         best_loss_single = losses[ind]
-            # best_rots_single = model.rotations[ind].detach().clone()
-            # best_trans_single = model.translations[ind].detach().clone()
         loop.set_description(f"loss: {best_loss_single.item():.3g}")
         loop.update()
     if best_rots is None:
@@ -376,13 +353,7 @@ def find_optimal_pose(
         best_trans = best_trans[inds][:num_initializations].detach().clone()
         best_rots = best_rots[inds][:num_initializations].detach().clone()
     loop.close()
-    # Add best ever:
 
-    if sort_best:
-        best_rots = torch.cat((best_rots_single.unsqueeze(0), best_rots[:-1]),
-                              0)
-        best_trans = torch.cat(
-            (best_trans_single.unsqueeze(0), best_trans[:-1]), 0)
     model.rotations = nn.Parameter(best_rots)
     model.translations = nn.Parameter(best_trans)
     return model
@@ -447,6 +418,7 @@ def find_optimal_poses(image_size,
             image=image,
             mask=annotation["target_crop_mask"],
             bbox=annotation["bbox"],
+            depth=annotation["depths"],
             square_bbox=annotation["square_bbox"],
             image_size=image_size,
             K=K,
@@ -523,7 +495,6 @@ def find_optimal_poses_indiviual(image_size,
     # Keep track of previous rotations to get temporally consistent initialization
     previous_rotations = None
     all_object_parameters = []
-    all_losses = []
     for image, annotation, K in zip(images, annotations, Ks):
         # Optimize pose to given mask evidence
         model = find_optimal_pose(
@@ -533,33 +504,34 @@ def find_optimal_poses_indiviual(image_size,
             mask=annotation["target_crop_mask"],
             bbox=annotation["bbox"],
             square_bbox=annotation["square_bbox"],
+            depth=annotation["depths"],
             image_size=image_size,
             K=K,
             num_iterations=num_iterations,
             num_initializations=num_initializations,
             debug=debug,
             viz_folder=os.path.dirname(viz_path),
-            sort_best=False,  # Keep initial ordering
+            sort_best=True,  # Keep initial ordering
             rotations_init=previous_rotations,
         )
         _, iou, _ = model()
-        best_idx = torch.argsort(iou)[-1]
+        # best_idx = torch.argsort(iou)[-1]
+        best_idx = 0
         verts_trans = model.apply_transformation()
         object_parameters = {
-            "rotations": rot6d_to_matrix(model.rotations).detach()[best_idx],
-            "translations": model.translations.detach()[best_idx],
+            "rotations": rot6d_to_matrix(model.rotations).detach()[best_idx].clone(),
+            "translations": model.translations.detach()[best_idx].clone(),
             "target_masks":
             torch.from_numpy(annotation["target_crop_mask"]).cuda(),
             "K_roi": model.K.detach(),
             "masks": annotation["full_mask"].cuda(),
             "verts": vertices.detach(),
-            "verts_trans": verts_trans.detach()[best_idx],
+            "verts_trans": verts_trans.detach()[best_idx].clone(),
         }
         if "flow" in annotation.keys(): # 最后一帧没有光流的监督
             object_parameters.update({"flows": torch.from_numpy(annotation["flow"]).cuda()})
         all_object_parameters.append(object_parameters)
-        # TODO: 考虑使用那种方式指定previous_rotations
-        previous_rotations = rot6d_to_matrix(model.rotations.detach())
+        previous_rotations = rot6d_to_matrix(model.rotations.detach().clone())
         # previous_rotations = rot6d_to_matrix(model.rotations.detach()[best_idx:best_idx+1].repeat(num_initializations, 1, 1))  # num_initializations, 3, 2 rot6d rotations
     all_final_params = []
     # Aggregate object pose candidates for all frames
