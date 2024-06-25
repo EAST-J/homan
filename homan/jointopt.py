@@ -294,25 +294,25 @@ def optimize_object(
     imgs = OrderedDict()
     optim_imgs = []
     for step in loop:
-        if step % viz_step == 0:
-            with torch.no_grad():
-                frontal, top_down = visualize_hand_object(model,
-                                                          images,
-                                                          dist=1,
-                                                          viz_len=viz_len)
+        # if step % viz_step == 0:
+        #     with torch.no_grad():
+        #         frontal, top_down = visualize_hand_object(model,
+        #                                                   images,
+        #                                                   dist=1,
+        #                                                   viz_len=viz_len)
 
-            file_name = f"{step:08d}.jpg"
-            front_top_path = os.path.join(viz_folder, file_name)
-            frontal = np.concatenate([img for img in frontal], 1)
-            top_down = np.concatenate([img for img in top_down], 1)
-            front_top = np.concatenate(
-                [frontal, top_down[:frontal.shape[0], :frontal.shape[1]]], 0)
-            front_top = cv2.resize(
-                front_top, (front_top.shape[1] // 2, front_top.shape[0] // 2))
-            Image.fromarray(front_top).save(front_top_path)
-            imgs[step] = front_top_path
-            optim_imgs.append(front_top)
-            print(f"Saved rendered image to {front_top_path}.")
+        #     file_name = f"{step:08d}.jpg"
+        #     front_top_path = os.path.join(viz_folder, file_name)
+        #     frontal = np.concatenate([img for img in frontal], 1)
+        #     top_down = np.concatenate([img for img in top_down], 1)
+        #     front_top = np.concatenate(
+        #         [frontal, top_down[:frontal.shape[0], :frontal.shape[1]]], 0)
+        #     front_top = cv2.resize(
+        #         front_top, (front_top.shape[1] // 2, front_top.shape[0] // 2))
+        #     Image.fromarray(front_top).save(front_top_path)
+        #     imgs[step] = front_top_path
+        #     optim_imgs.append(front_top)
+        #     print(f"Saved rendered image to {front_top_path}.")
         optimizer.zero_grad()
         loss_dict, metric_dict = model(loss_weights=loss_weights)
         loss_dict_weighted = {
@@ -329,11 +329,11 @@ def optimize_object(
         loop.set_description(f"Loss {loss.item():.4f}")
         loss.backward()
         optimizer.step()
-    optim_imgs = [optim_imgs[0] for _ in range(30)
-                  ] + optim_imgs + [optim_imgs[-1] for _ in range(50)]
-    np2vid.make_video(optim_imgs,
-                      front_top_path.replace(".jpg", f"{fps}.gif"),
-                      fps=fps)
+    # optim_imgs = [optim_imgs[0] for _ in range(30)
+    #               ] + optim_imgs + [optim_imgs[-1] for _ in range(50)]
+    # np2vid.make_video(optim_imgs,
+    #                   front_top_path.replace(".jpg", f"{fps}.gif"),
+    #                   fps=fps)
     # video_path = os.path.join(os.path.dirname(viz_folder), "joint_optim.webm")
     # np2vid.make_video(optim_imgs, video_path, fps=fps)
     # np2vid.make_video(optim_imgs, video_path.replace(".webm", ".mp4"), fps=fps)

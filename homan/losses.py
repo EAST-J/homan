@@ -264,22 +264,23 @@ class Losses_Obj():
     def compute_depth_loss(self, verts, faces):
         camintr = self.camintr_rois_object
         rend_depth = self.renderer(verts, faces, K=camintr, mode="depth") # bs * 256 * 256
-        rend_sil = self.keep_mask_object * self.renderer(verts, faces, K=camintr, mode="silhouettes")
-        rend_depth[rend_sil!=1] = 100
+        rend_sil = self.renderer(verts, faces, K=camintr, mode="silhouettes")
+        rend_depth[torch.logical_or(rend_sil!=1, self.keep_mask_object!=1)] = 100
         rend_depth_min = torch.min(rend_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
-        rend_depth[rend_sil!=1] = -1
+        rend_depth[torch.logical_or(rend_sil!=1, self.keep_mask_object!=1)] = -1
         rend_depth_max = torch.max(rend_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1) # bs * 1 * 1
         # 背景值为0 (只获取物体的相对深度，以物体距离相机最远的点为基准)
         normalized_rend_depth = (rend_depth_max - rend_depth) / (rend_depth_max - rend_depth_min)
-        normalized_rend_depth[rend_sil!=1] = 0
+        normalized_rend_depth[torch.logical_or(rend_sil!=1, self.keep_mask_object!=1)] = 0
         gt_depth = self.depth_object.clone()
-        gt_depth[self.keep_mask_object!=1] = 1e6
+        gt_depth[self.ref_mask_object!=1] = 1e6
         gt_depth_min = torch.min(gt_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
-        gt_depth[self.keep_mask_object!=1] = -1
+        gt_depth[self.ref_mask_object!=1] = -1
         gt_depth_max = torch.max(gt_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
         normalized_gt_depth = (gt_depth - gt_depth_min) / (gt_depth_max - gt_depth_min)
+        normalized_gt_depth[self.ref_mask_object!=1] = 0
         depth_loss = torch.sum(
-            (normalized_rend_depth - normalized_gt_depth)**2) / self.keep_mask_object.sum()
+            (normalized_rend_depth - normalized_gt_depth)**2 * self.ref_mask_object)  / self.keep_mask_object.sum()
         return {
             "loss_depth_obj": depth_loss / len(verts)
         }

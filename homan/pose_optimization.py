@@ -64,7 +64,6 @@ class PoseOptimizer(nn.Module):
         self.register_buffer("faces", faces.repeat(num_initializations, 1, 1))
         self.register_buffer(
             "textures", textures.repeat(num_initializations, 1, 1, 1, 1, 1))
-
         # Load reference mask.
         # Convention for silhouette-aware loss: -1=occlusion, 0=bg, 1=fg.
         image_ref = torch.from_numpy((ref_image > 0).astype(np.float32)) # 物体的分割部分
@@ -76,9 +75,9 @@ class PoseOptimizer(nn.Module):
                              keep_mask.repeat(num_initializations, 1, 1))
         self.register_buffer("depth", 
                              depth[None, :, :].repeat(num_initializations, 1, 1))
-        self.pool = torch.nn.MaxPool2d(kernel_size=kernel_size,
-                                       stride=1,
-                                       padding=(kernel_size // 2))
+        # self.pool = torch.nn.MaxPool2d(kernel_size=kernel_size,
+        #                                stride=1,
+        #                                padding=(kernel_size // 2))
         self.rotations = nn.Parameter(rotation_init.clone().float(),
                                       requires_grad=True)
         if rotation_init.shape[0] != translation_init.shape[0]:
@@ -86,11 +85,6 @@ class PoseOptimizer(nn.Module):
                                                        1)
         self.translations = nn.Parameter(translation_init.clone().float(),
                                          requires_grad=True)
-        mask_edge = self.compute_edges(image_ref.unsqueeze(0)).cpu().numpy() # 获取mask的边缘信息
-        edt = distance_transform_edt(1 - (mask_edge > 0))**(power * 2) # 获取所有像素点到边缘的距离
-        self.register_buffer(
-            "edt_ref_edge",
-            torch.from_numpy(edt).repeat(num_initializations, 1, 1).float())
         # Setup renderer.
         if K is None:
             K = torch.cuda.FloatTensor([[[1, 0, 0.5], [0, 1, 0.5], [0, 0, 1]]])
@@ -143,14 +137,14 @@ class PoseOptimizer(nn.Module):
 
     def comput_depth_loss(self, verts, faces):
         rend_depth = self.renderer(verts, faces, mode="depth") # bs * 256 * 256
-        rend_sil = self.keep_mask * self.renderer(verts, faces, mode="silhouettes")
-        rend_depth[rend_sil!=1] = 100
+        rend_sil = self.renderer(verts, faces, mode="silhouettes")
+        rend_depth[torch.logical_or(rend_sil!=1, self.keep_mask!=1)] = 100
         rend_depth_min = torch.min(rend_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
-        rend_depth[rend_sil!=1] = -1
+        rend_depth[torch.logical_or(rend_sil!=1, self.keep_mask!=1)] = -1
         rend_depth_max = torch.max(rend_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1) # bs * 1 * 1
         # 背景值为0 (只获取物体的相对深度，以物体距离相机最远的点为基准)
         normalized_rend_depth = (rend_depth_max - rend_depth) / (rend_depth_max - rend_depth_min)
-        normalized_rend_depth[rend_sil!=1] = 0
+        normalized_rend_depth[torch.logical_or(rend_sil!=1, self.keep_mask!=1)] = 0
         gt_depth = self.depth.clone()
         gt_depth[self.image_ref!=1] = 1e6
         gt_depth_min = torch.min(gt_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
@@ -158,10 +152,8 @@ class PoseOptimizer(nn.Module):
         gt_depth_max = torch.max(gt_depth.reshape(rend_depth.shape[0], -1), dim=1, keepdim=True)[0].unsqueeze(-1)
         normalized_gt_depth = (gt_depth - gt_depth_min) / (gt_depth_max - gt_depth_min)
         normalized_gt_depth[self.image_ref!=1] = 0
-        # depth_loss = torch.sum(
-        #     (normalized_rend_depth - normalized_gt_depth)**2 * self.image_ref) / self.image_ref.sum()
         depth_loss = torch.sum(
-            (normalized_rend_depth - normalized_gt_depth)**2, dim=(1, 2))
+            self.image_ref * (normalized_rend_depth - normalized_gt_depth)**2, dim=(1, 2))
         return depth_loss
 
     def forward(self):
@@ -170,12 +162,11 @@ class PoseOptimizer(nn.Module):
             verts, self.faces, mode="silhouettes") # 渲染物体3D Model所获得的mask(手部部分会被自动mask掉)
         loss_dict = {}
         loss_dict["mask"] = torch.sum((image - self.image_ref)**2, dim=(1, 2))
+        # 考虑depth loss的权重
         loss_dict["depth"] = self.comput_depth_loss(verts, self.faces)
         with torch.no_grad():
             iou = ioumetrics.batch_mask_iou(image.detach(),
                                             self.image_ref.detach())
-        # loss_dict["chamfer"] = self.lw_chamfer * torch.sum(
-        #     self.compute_edges(image) * self.edt_ref_edge, dim=(1, 2)) # 渲染的边缘到真值边缘的距离和
         loss_dict["offscreen"] = 100000 * self.compute_offscreen_loss(verts)
         return loss_dict, iou, image
 
@@ -511,7 +502,7 @@ def find_optimal_poses_indiviual(image_size,
             num_initializations=num_initializations,
             debug=debug,
             viz_folder=os.path.dirname(viz_path),
-            sort_best=True,  # Keep initial ordering
+            sort_best=True,
             rotations_init=previous_rotations,
         )
         _, iou, _ = model()

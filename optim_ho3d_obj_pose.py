@@ -11,17 +11,10 @@ import numpy as np
 from PIL import Image
 import trimesh 
 import pickle as pkl
-from handmocap.hand_bbox_detector import HandBboxDetector
 from detectron2.structures import BitMasks
 from glob import glob
-from homan.tracking import trackseq
-from homan.mocap import get_hand_bbox_detector
 from homan.utils.bbox import  make_bbox_square, bbox_xy_to_wh, bbox_wh_to_xy
 
-from homan.prepare.frameinfos import get_frame_infos
-from homan.pointrend import MaskExtractor
-from handmocap.hand_mocap_api import HandMocap
-from homan.viz.vizframeinfo import viz_frame_info
 from homan.lib2d import maskutils
 import cv2
 from homan.utils.geometry import rot6d_to_matrix
@@ -30,6 +23,8 @@ from detectron2.layers.roi_align import ROIAlign
 import json
 
 # TODO: 解决长序列CUDA Memory的问题
+
+
 def crop_and_resize(input_tensor: torch.Tensor, boxes: torch.Tensor, mask_size: int) -> torch.Tensor:
     """
     Crop each bitmask by the given box, and resize results to (mask_size, mask_size).
@@ -150,7 +145,6 @@ def filter_object_parameters(object_parameters):
         verts_can = obj_param["verts"].clone().squeeze(0)
         verts = []
         new_obj_rot = []
-        # 对于不对称的物体是否会影响IOU的值？？
         for rot_m in R_axis_m:
             rot_m = rot_m.to(verts_can.device)
             R_m = obj_rot @ rot_m
@@ -160,6 +154,8 @@ def filter_object_parameters(object_parameters):
         new_obj_rot = torch.cat(new_obj_rot)
         smooth_loss = torch.mean(((verts - previous_verts)**2).reshape(verts.shape[0], -1), dim=1)
         best_idx = torch.argsort(smooth_loss)[0]
+        if best_idx != 0:
+            print("filter id:{}".format(idx))
         previous_verts = verts[best_idx:best_idx+1].clone()
 
         obj_param.update({"rotations": new_obj_rot[best_idx:best_idx+1].clone().transpose(1, 2)})
@@ -168,12 +164,12 @@ def filter_object_parameters(object_parameters):
 
 
 # Load images
-seq_name = "ND2"
-exp_name ="gt"
+seq_name = "SM2"
+exp_name ="pred"
 data_root = "/remote-home/jiangshijian/data/HO3D_v3/train"
 optim_obj_scale = True
-start_idx = 150
-end_idx = 350
+start_idx = 0
+end_idx = 199
 image_paths = sorted(glob(os.path.join(data_root, seq_name, "rgb", "*.jpg")))[start_idx:end_idx]
 print(len(image_paths))
 with open(os.path.join(data_root, seq_name, "meta", "0000.pkl"), "rb") as f:
@@ -183,10 +179,12 @@ if exp_name == 'gt':
     obj_path = os.path.join("local_data/datasets/ycbmodels/", objName, "textured_simple_2000.obj")
     obj_init_scale = 0.5 # Obj dimension in meters (0.1 => 10cm, 0.01 => 1cm)
 else:
-    obj_path = "/remote-home/jiangshijian/shap-e/drill.ply" # 0.5
+    obj_path = "/remote-home/jiangshijian/shap-e/bottle.ply"
+    # obj_path = "/remote-home/jiangshijian/shap-e/high_drill.ply"
+    # obj_path = "/remote-home/jiangshijian/shap-e/drill.ply" # 0.5
     # obj_path = "/remote-home/jiangshijian/shap-e/cleaner.ply" # 0.1
-    # obj_path = "/remote-home/jiangshijian/shap-e/cracker_box.ply"
-    obj_init_scale = 0.5
+    # obj_path = "/remote-home/jiangshijian/shap-e/cracker_box_trans.ply"
+    obj_init_scale = 1.0
 # Initialize object scale
 obj_mesh = trimesh.load(obj_path, force="mesh")
 obj_verts = np.array(obj_mesh.vertices).astype(np.float32)
@@ -209,7 +207,6 @@ masks = [(Image.open(image_path.replace("rgb", "seg")[:-4] + ".png")) for image_
 masks_np = [np.array(mask) for mask in masks]
 flows_np = [np.load(image_path.replace("rgb", "flow")[:-4] + ".npy") if os.path.exists(image_path.replace("rgb", "flow")[:-4] + ".npy") else None for image_path in image_paths[:-1]]
 depths_np = [np.load(image_path.replace("rgb", "monocular_depth")[:-4] + ".npy") if os.path.exists(image_path.replace("rgb", "monocular_depth")[:-4] + ".npy") else None for image_path in image_paths]
-# depths_np = [np.load(image_path.replace("rgb", "gt_monocular_depth")[:-4] + ".npy") if os.path.exists(image_path.replace("rgb", "gt_monocular_depth")[:-4] + ".npy") else None for image_path in image_paths]
 hand_masks_np = []
 obj_masks_np = []
 for mask in masks_np:
@@ -221,10 +218,8 @@ for mask in masks_np:
     hand_masks_np.append(hand_mask)
     obj_masks_np.append(obj_mask)
 
-sample_folder = os.path.join("tmp_ho3d/", seq_name, exp_name)
+sample_folder = os.path.join("tmp_ho3d_test/", seq_name, exp_name)
 os.makedirs(sample_folder, exist_ok=True)
-board = SummaryWriter(os.path.join(sample_folder, "board"))
-
 
 # Define camera parameters
 height, width, _ = images_np[0].shape
@@ -268,12 +263,12 @@ object_parameters = find_optimal_poses_indiviual(
     faces=obj_faces,
     annotations=obj_mask_infos,
     num_initializations=200,
-    num_iterations=10, # Increase to get more accurate initializations
+    num_iterations=100, # Increase to get more accurate initializations
     Ks=np.stack(camintrs),
     viz_path=os.path.join(sample_folder, "optimal_pose.png"),
     debug=False,
 )
-object_parameters = filter_object_parameters(object_parameters)
+
 '''
 object_parameters: List, len(images)
     rotations: 1*3*3
@@ -301,15 +296,15 @@ for idx, obj_param in enumerate(object_parameters):
     }
     np.savez(os.path.join(sample_folder, "init_obj_infos/{:04d}.npz".format(idx + start_idx)), **data)
 
-
+board = SummaryWriter(os.path.join(sample_folder, "board"))
 from homan.jointopt import optimize_object
-
-coarse_num_iterations = 200 # Increase to give more steps to converge
+object_parameters = filter_object_parameters(object_parameters)
+coarse_num_iterations = 500 # Increase to give more steps to converge
 coarse_viz_step = 10 # Decrease to visualize more optimization steps
 
 coarse_loss_weights = {
         "lw_sil_obj": 1.0,
-        "lw_depth_obj": 1.0,
+        "lw_depth_obj": 5.0,
         "lw_scale_obj": 0.000,
         "lw_smooth_obj": 100.0,
         "lw_flow_obj": 0.0,
@@ -340,6 +335,39 @@ model, loss_evolution, imgs = optimize_object(
     viz_folder=step2_viz_folder,
     board = board,
 )
+
+# fine_num_iterations = 200 # Increase to give more steps to converge
+# fine_viz_step = 10 # Decrease to visualize more optimization steps
+
+# fine_loss_weights = {
+#         "lw_sil_obj": 1.0,
+#         "lw_depth_obj": 1.0,
+#         "lw_scale_obj": 0.000,
+#         "lw_smooth_obj": 100.0,
+#         "lw_flow_obj": 0.0,
+#         "lw_edge_obj": 0.0000,
+#         "lw_correspondence_obj": 0.00
+#     }
+
+# step3_folder = os.path.join(sample_folder, "jointoptim_step3")
+# step3_viz_folder = os.path.join(step2_folder, "viz")
+
+# model, loss_evolution, imgs = optimize_object(
+#     object_parameters=object_parameters,
+#     objvertices=obj_verts_can,
+#     correspondence_info = correspondence_info,
+#     objfaces=np.stack([obj_faces for _ in range(len(images_np))]),
+#     optimize_object_scale=False,
+#     loss_weights=fine_loss_weights,
+#     image_size=image_size,
+#     num_iterations=fine_num_iterations + 1,  # Increase to get more accurate initializations
+#     images=np.stack(images_np),
+#     camintr=camintr_nc,
+#     state_dict=None,
+#     viz_step=fine_viz_step,
+#     viz_folder=step3_viz_folder,
+#     board = board,
+# )
 '''
 Parameter Lists:
 mano_pca_pose: B * 45
